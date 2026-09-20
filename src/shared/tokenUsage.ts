@@ -1,0 +1,573 @@
+import { resolveCatalogModel } from "./modelCatalog";
+import type { GateFailureLayer } from "./messageGate";
+
+/**
+ * Per-turn usage ledger — the real, append-only accounting the Token Usage
+ * dashboard is built on. One {@link TurnUsageRecord} is written per completed
+ * turn (on the harness `turn_complete`), keyed by party/member/session identity,
+ * then range-queried and aggregated for the dashboard.
+ *
+ * Honesty rules (mirroring docs/디자인 핸드오프/token_usage_brief.md §4/§8):
+ *   - Token fields are only populated when the harness reports them. A missing
+ *     field means "not reported", NEVER zero. Aggregation must treat
+ *     `undefined` as absent, not 0.
+ *   - `trigger` records the real cause when known and `"unknown"` otherwise; it
+ *     is never fabricated into `"user"`.
+ *   - `costUsd` is the harness/provider-reported bill when available (실측/
+ *     provider-reported); the list-price `≈$` conversion is DERIVED at
+ *     aggregation time and kept in a separate field so 실측 and 환산 stay
+ *     visually distinguishable, as the brief requires.
+ */
+
+export type TokenTrigger =
+  | "user"          // a person's direct send — the baseline
+  | "party-message" // a member-to-member message drove the turn
+  | "gate-review"   // Message Gate reviewer call
+  | "compact"       // context compaction turn
+  | "subagent"      // a subagent turn
+  | "init"          // session init / background poll
+  | "unknown";      // origin genuinely undetermined — never guessed
+
+export const TOKEN_TRIGGERS: TokenTrigger[] = [
+  "user",
+  "party-message",
+  "gate-review",
+  "compact",
+  "subagent",
+  "init",
+  "unknown",
+];
+
+/**
+ * The token split for one turn, as far as the harness reports it. Every field is
+ * optional on purpose — see the honesty rules above.
+ */
+export interface TurnTokenBreakdown {
+  /** Fresh (non-cached) input tokens. */
+  input?: number;
+  /** Cache-read input tokens (cheap reads). */
+  cacheRead?: number;
+  /** Cache-creation input tokens (cache writes). */
+  cacheWrite?: number;
+  /** Five-minute cache writes, when the provider reports the TTL split. */
+  cacheWrite5m?: number;
+  /** One-hour cache writes, when the provider reports the TTL split. */
+  cacheWrite1h?: number;
+  /** Individual model requests, when the harness reports per-request deltas. */
+  pricingSegments?: TokenPricingSegment[];
+  /** Generated / output tokens. */
+  output?: number;
+  /** Context-window occupancy at turn end (non-cumulative; drops after compact). */
+  context?: number;
+  /** Context-window size when the harness reports it numerically. */
+  contextWindow?: number;
+}
+
+export interface TokenPricingSegment {
+  input?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cacheWrite5m?: number;
+  cacheWrite1h?: number;
+  output?: number;
+}
+
+export interface TurnUsageRecord {
+  /** Turn end time (ISO 8601). Bucketed by end time — usage is reported then. */
+  at: string;
+  /**
+   * Turn start time (ISO 8601), when known. Needed for **active time** — the
+   * design's rate/utilization metrics measure real elapsed run time, not turn
+   * count. Missing means "not reported" (older records), so a turn without it
+   * contributes 0 active time, never a fabricated span.
+   */
+  atStart?: string;
+  /** Party id — the `#id` identity (parties with the same name stay separate). */
+  partyId?: string;
+  /** Member name within the party. */
+  member?: string;
+  /** Resumable harness/thread session id. */
+  sessionId?: string;
+  /** Transient app-session id (the ManagedSession id) — always present. */
+  appSessionId: string;
+  /** Provider the turn drew from: `claude` | `codex` | `cursor` | `openrouter` | … */
+  provider?: string;
+  model?: string;
+  effort?: string;
+  /** Provider serving tier used for this turn (for example Cursor standard/fast). */
+  serviceTier?: string;
+  trigger: TokenTrigger;
+  tokens: TurnTokenBreakdown;
+  /** Harness/provider-reported bill in USD when available (실측/provider-reported). */
+  costUsd?: number;
+  /** Cost provenance: `harness-reported` | `provider-reported` | `estimated` | `subscription` | … */
+  costBasis?: string;
+  /** Cost source: `claude-code` | `openrouter` | `codex` | `estimate` | … */
+  costSource?: string;
+  /**
+   * Present on `gate-review` turns.
+   *
+   * `verdict` is set when the review COMPLETED; `failure` is set instead when it
+   * did not and the gate failed open. Recording the failure is the whole point:
+   * the message is delivered either way, so a review that never reached a
+   * verdict used to leave no trace in the ledger at all — which made the gate's
+   * own error rate unmeasurable while the feature looked like it was filtering.
+   *
+   * The two are mutually exclusive, and `verdict` keeps its exact old meaning so
+   * every existing reader stays correct.
+   */
+  gate?: {
+    verdict?: "allow" | "reject";
+    failure?: { layer: GateFailureLayer; detail?: string };
+  };
+}
+
+// ── Aggregation ────────────────────────────────────────────────────────────
+
+export interface TokenUsageQuery {
+  /** Inclusive range start (epoch ms). */
+  fromMs: number;
+  /** Exclusive range end (epoch ms). */
+  toMs: number;
+  /** Bucket width in minutes (1/3/5/15/30/60/240/1440). */
+  bucketMinutes: number;
+  /** Restrict to a single party id; omit for all parties. */
+  partyId?: string;
+  /** Restrict to a single trigger; omit for all. */
+  trigger?: TokenTrigger;
+}
+
+export interface SeriesTotals {
+  costUsd: number;      // real bill sum (0 when all subscription/unavailable)
+  estCostUsd: number;   // list-price ≈$ conversion of the turns that HAVE a rate
+  /** Best available cost: provider/harness reported amount, otherwise list-price estimate. */
+  effectiveCostUsd: number;
+  /** Turns contributing an exact provider/harness-reported amount. */
+  reportedCostTurns: number;
+  /** Turns contributing a catalog list-price estimate. */
+  estimatedCostTurns: number;
+  /** Turns carrying neither a reported cost nor a catalog rate, so they are
+   *  missing from `effectiveCostUsd` entirely. Non-zero ⇒ the total is a floor, and
+   *  the UI must say so; `unpricedTurns === turns` ⇒ nothing is known at all
+   *  and showing ≈$0.000 would be a lie. */
+  unpricedTurns: number;
+  /** Tokens belonging to those turns — the size of what is unaccounted for. */
+  unpricedTokens: number;
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+  turns: number;
+  /** Tokens from overhead triggers (party-message/gate-review/compact/init). */
+  overheadTokens: number;
+  /** Total tokens (input+cacheRead+cacheWrite+output) in the earlier half of the
+   *  range — paired with {@link secondHalfTokens} to derive a trend direction. */
+  firstHalfTokens: number;
+  /** Total tokens in the later half of the range. */
+  secondHalfTokens: number;
+}
+
+/** Overhead triggers: spend not directly executing a user instruction. */
+export const OVERHEAD_TRIGGERS: ReadonlySet<TokenTrigger> = new Set<TokenTrigger>([
+  "party-message",
+  "gate-review",
+  "compact",
+  "init",
+]);
+
+export interface RollupRow extends SeriesTotals {
+  key: string;   // partyId, `${partyId}:${member}`, or trigger
+  label: string;
+  /** Total tokens across all kinds (the row's headline usage number). */
+  totalTokens: number;
+  /** Real elapsed run time in ms — a UNION of this row's turn intervals, so a
+   *  party's members running concurrently are counted once (design §4). 0 when
+   *  no turn carried a start time (see {@link TurnUsageRecord.atStart}). */
+  activeMs: number;
+  /** cacheRead ÷ all input (fresh+read+write); undefined when no input reported. */
+  cacheHitRate?: number;
+  /** overheadTokens ÷ totalTokens; undefined when nothing reported. */
+  overheadRatio?: number;
+  /** Tokens per active hour (totalTokens ÷ activeHours); undefined without active time. */
+  ratePerHour?: number;
+  /** Later-vs-earlier-half token change, %; undefined when the earlier half is empty. */
+  trendPct?: number;
+  /** Most-recent model/effort seen for this row — the dominant runtime for its
+   *  chips (a session's model/effort can change mid-run; this is the latest). */
+  lastModel?: string;
+  lastEffort?: string;
+}
+
+export interface UsageBucket {
+  tMs: number;                         // bucket start (epoch ms)
+  totals: SeriesTotals;
+  bySeries: Record<string, SeriesTotals>; // keyed by series key (party id or member)
+  /** Total tokens per trigger in this bucket — drives the G2 composition-over-time
+   *  chart. Keyed by {@link TokenTrigger}; absent triggers are simply missing. */
+  byTrigger: Record<string, number>;
+}
+
+export interface TokenUsageAggregate {
+  fromMs: number;
+  toMs: number;
+  bucketMinutes: number;
+  partyId?: string;
+  buckets: UsageBucket[];
+  parties: RollupRow[];
+  members: RollupRow[];
+  triggers: RollupRow[];
+  totals: SeriesTotals;
+  /** Total tokens across everything in range (totals.* summed). */
+  totalTokens: number;
+  /** UNION of every in-range turn interval, ms — the real wall-clock the range
+   *  was actively running (concurrent turns counted once). Drives the "활성
+   *  시간당 토큰" rate headline. 0 when no turn carried a start time. */
+  activeMsUnion: number;
+  /** totalTokens ÷ (activeMsUnion in hours); undefined without active time. */
+  ratePerHour?: number;
+  /** overheadTokens ÷ totalTokens across the range; undefined when nothing reported. */
+  overheadRatio?: number;
+  /** Message Gate stats over the range (from `gate-review` turns), or undefined
+   *  when the gate never ran. `netTokens` is the gate's net effect measured on the
+   *  cost side (−reviewTokens) — downstream savings aren't measurable, so a
+   *  persistently negative net is the honest "게이트가 순비용" signal. */
+  gate?: {
+    /** Reviews that COMPLETED (reached a verdict). Excludes failures. */
+    reviews: number;
+    rejects: number;
+    /** rejects / reviews — over completed reviews only. */
+    rejectRate: number;
+    reviewTokens: number;
+    netTokens: number;
+    /** Reviews that failed open without a verdict. */
+    failures: number;
+    /** failures / (reviews + failures) — how much of the gate is not running. */
+    failureRate: number;
+    failuresByLayer: Partial<Record<GateFailureLayer, number>>;
+  };
+  /** How many raw records fed this aggregate — 0 ⇒ the UI shows "아직 없음". */
+  recordCount: number;
+}
+
+function emptyTotals(): SeriesTotals {
+  return {
+    costUsd: 0, estCostUsd: 0, effectiveCostUsd: 0, reportedCostTurns: 0, estimatedCostTurns: 0,
+    unpricedTurns: 0, unpricedTokens: 0,
+    input: 0, cacheRead: 0, cacheWrite: 0, output: 0, turns: 0,
+    overheadTokens: 0, firstHalfTokens: 0, secondHalfTokens: 0,
+  };
+}
+
+/** Total tokens across all kinds for one turn's split. */
+function turnTokensTotal(t: TurnTokenBreakdown): number {
+  return (t.input || 0) + (t.cacheRead || 0) + (t.cacheWrite || 0) + (t.output || 0);
+}
+
+/** Merges [start,end] ms intervals and returns the total covered span (union). */
+function unionMs(intervals: Array<[number, number]>): number {
+  if (!intervals.length) return 0;
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let [curStart, curEnd] = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const [s, e] = sorted[i];
+    if (s > curEnd) {
+      total += curEnd - curStart;
+      curStart = s;
+      curEnd = e;
+    } else if (e > curEnd) {
+      curEnd = e;
+    }
+  }
+  total += curEnd - curStart;
+  return total;
+}
+
+/** Provider defaults used only when a catalog entry has no explicit cache rate. */
+const CACHE_WRITE_5M_MULT = 1.25;
+const CACHE_WRITE_1H_MULT = 2;
+const CACHE_READ_MULT = 0.1;
+
+/**
+ * List-price `≈$` for one turn: real token counts × the model's catalog per-1M
+ * rate. This is a DETERMINISTIC comparison value (not a bill) — it lets
+ * subscription turns (Claude/Codex), which carry no per-turn bill, still be
+ * ranked by cost.
+ *
+ * Returns `undefined` when the model carries no catalog rate — NOT 0. A 0 sums
+ * into a total that then reads as "this cost nothing", which is exactly the
+ * silent fallback the project forbids; the caller has to be able to say
+ * "알 수 없음" instead. See {@link SeriesTotals.unpricedTurns}.
+ */
+export function estimatedTurnCostUsd(record: TurnUsageRecord): number | undefined {
+  const catalog = record.model ? resolveCatalogModel(record.model) : undefined;
+  const tierId = record.serviceTier?.trim()
+    ? record.serviceTier.trim()
+    : record.provider === "cursor" ? catalog?.serviceTier?.default : undefined;
+  const tier = tierId
+    ? catalog?.serviceTierPricing?.[tierId]
+    : undefined;
+  const inPerM = tier?.inPerM ?? catalog?.inPerM;
+  const outPerM = tier?.outPerM ?? catalog?.outPerM ?? catalog?.ioPerM;
+  if (typeof inPerM !== "number" && typeof outPerM !== "number") {
+    return undefined;
+  }
+  const t = record.tokens;
+  const segments = t.pricingSegments?.length ? t.pricingSegments : [t];
+  return segments.reduce((sum, segment) => sum + priceTokenSegment(segment, catalog, tier, inPerM, outPerM), 0);
+}
+
+function priceTokenSegment(
+  t: TokenPricingSegment,
+  catalog: ReturnType<typeof resolveCatalogModel>,
+  tier: { inPerM: number; outPerM: number; cacheReadPerM?: number; cacheWritePerM?: number } | undefined,
+  inPerM: number | undefined,
+  outPerM: number | undefined,
+): number {
+  const cacheWrite5m = t.cacheWrite5m || 0;
+  const cacheWrite1h = t.cacheWrite1h || 0;
+  const unclassifiedCacheWrite = Math.max(0, (t.cacheWrite || 0) - cacheWrite5m - cacheWrite1h);
+  const promptTokens = (t.input || 0) + (t.cacheRead || 0) + (t.cacheWrite || 0);
+  const long = catalog?.longContextPricing && promptTokens > catalog.longContextPricing.thresholdTokens
+    ? catalog.longContextPricing
+    : undefined;
+  const inputMultiplier = long?.inputMultiplier ?? 1;
+  const outputMultiplier = long?.outputMultiplier ?? 1;
+  const cacheReadPerM = tier?.cacheReadPerM ?? catalog?.cacheReadPerM
+    ?? (typeof inPerM === "number" ? inPerM * CACHE_READ_MULT : undefined);
+  const cacheWritePerM = tier?.cacheWritePerM ?? catalog?.cacheWritePerM
+    ?? (typeof inPerM === "number" ? inPerM * (catalog?.provider === "anthropic" ? CACHE_WRITE_5M_MULT : 1) : undefined);
+  const cacheWrite1hPerM = typeof inPerM === "number"
+    ? inPerM * (catalog?.provider === "anthropic" ? CACHE_WRITE_1H_MULT : 1)
+    : undefined;
+  const inCost = typeof inPerM === "number" ? ((t.input || 0) / 1_000_000) * inPerM * inputMultiplier : 0;
+  const cacheReadCost = typeof cacheReadPerM === "number" ? ((t.cacheRead || 0) / 1_000_000) * cacheReadPerM * inputMultiplier : 0;
+  const cacheWriteCost = typeof cacheWritePerM === "number" ? ((cacheWrite5m + unclassifiedCacheWrite) / 1_000_000) * cacheWritePerM * inputMultiplier : 0;
+  const cacheWrite1hCost = typeof cacheWrite1hPerM === "number" ? (cacheWrite1h / 1_000_000) * cacheWrite1hPerM * inputMultiplier : 0;
+  const outCost = typeof outPerM === "number" ? ((t.output || 0) / 1_000_000) * outPerM * outputMultiplier : 0;
+  return inCost + cacheReadCost + cacheWriteCost + cacheWrite1hCost + outCost;
+}
+
+/** Provider/harness bill when present; otherwise the deterministic list-price estimate. */
+export function effectiveTurnCostUsd(record: TurnUsageRecord): number | undefined {
+  return typeof record.costUsd === "number" && Number.isFinite(record.costUsd)
+    ? record.costUsd
+    : estimatedTurnCostUsd(record);
+}
+
+function addTurn(into: SeriesTotals, record: TurnUsageRecord, midMs?: number): void {
+  into.costUsd += typeof record.costUsd === "number" ? record.costUsd : 0;
+  into.input += record.tokens.input || 0;
+  into.cacheRead += record.tokens.cacheRead || 0;
+  into.cacheWrite += record.tokens.cacheWrite || 0;
+  into.output += record.tokens.output || 0;
+  into.turns += 1;
+  const total = turnTokensTotal(record.tokens);
+  const reported = typeof record.costUsd === "number" && Number.isFinite(record.costUsd) ? record.costUsd : undefined;
+  const est = estimatedTurnCostUsd(record);
+  if (est !== undefined) into.estCostUsd += est;
+  if (reported !== undefined) {
+    into.effectiveCostUsd += reported;
+    into.reportedCostTurns += 1;
+  } else if (est !== undefined) {
+    into.effectiveCostUsd += est;
+    into.estimatedCostTurns += 1;
+  } else {
+    into.unpricedTurns += 1;
+    into.unpricedTokens += total;
+  }
+  if (OVERHEAD_TRIGGERS.has(record.trigger)) {
+    into.overheadTokens += total;
+  }
+  if (midMs !== undefined) {
+    if (Date.parse(record.at) < midMs) into.firstHalfTokens += total;
+    else into.secondHalfTokens += total;
+  }
+}
+
+/** Query for the raw per-turn records behind the member drill-in. */
+export interface TokenUsageTurnsQuery {
+  fromMs: number;
+  toMs: number;
+  partyId?: string;
+  member?: string;
+  /** Cap the number of returned records (newest-kept); omit for all. */
+  limit?: number;
+}
+
+/**
+ * Selects the raw turn records for one member/party/range, chronological. The
+ * drill-in derives both the context-growth curve (chronological) and the
+ * expensive-turns list (sorted by total tokens) from this — no new instrumentation
+ * is needed because every turn is already a ledger record.
+ */
+export function selectTurns(records: TurnUsageRecord[], query: TokenUsageTurnsQuery): TurnUsageRecord[] {
+  const { fromMs, toMs, partyId, member, limit } = query;
+  const rows = records.filter((r) => {
+    const t = Date.parse(r.at);
+    if (!Number.isFinite(t) || t < fromMs || t >= toMs) return false;
+    if (partyId && r.partyId !== partyId) return false;
+    if (member && r.member !== member) return false;
+    return true;
+  }).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  return typeof limit === "number" && limit > 0 && rows.length > limit ? rows.slice(rows.length - limit) : rows;
+}
+
+export function bucketStartMs(atMs: number, bucketMinutes: number): number {
+  const width = Math.max(1, bucketMinutes) * 60_000;
+  return Math.floor(atMs / width) * width;
+}
+
+/**
+ * Pure aggregation over raw records. Buckets by turn-end time; rolls up by party,
+ * by member (`party:member`), and by trigger. Series keys are member names when a
+ * single party is scoped, else party ids — matching the dashboard's scope model.
+ */
+export function aggregateUsage(records: TurnUsageRecord[], query: TokenUsageQuery): TokenUsageAggregate {
+  const { fromMs, toMs, bucketMinutes, partyId, trigger } = query;
+  const inRange = records.filter((r) => {
+    const t = Date.parse(r.at);
+    if (!Number.isFinite(t) || t < fromMs || t >= toMs) return false;
+    if (partyId && r.partyId !== partyId) return false;
+    if (trigger && r.trigger !== trigger) return false;
+    return true;
+  });
+
+  const midMs = fromMs + (toMs - fromMs) / 2;
+  const scopedToParty = !!partyId;
+  const seriesKeyOf = (r: TurnUsageRecord): string =>
+    scopedToParty ? (r.member || "(unknown)") : (r.partyId || "(none)");
+
+  const bucketMap = new Map<number, UsageBucket>();
+  const parties = new Map<string, RollupRow>();
+  const members = new Map<string, RollupRow>();
+  const triggers = new Map<string, RollupRow>();
+  const totals = emptyTotals();
+  let gateReviews = 0, gateRejects = 0, gateReviewTokens = 0, gateFailures = 0;
+  const gateFailuresByLayer: Partial<Record<GateFailureLayer, number>> = {};
+  // Per-row + global turn intervals [start,end]ms, unioned into activeMs later.
+  const partyIvals = new Map<string, Array<[number, number]>>();
+  const memberIvals = new Map<string, Array<[number, number]>>();
+  const triggerIvals = new Map<string, Array<[number, number]>>();
+  const allIvals: Array<[number, number]> = [];
+  const memberLastAt = new Map<string, number>();
+
+  const ensureRow = (map: Map<string, RollupRow>, key: string, label: string): RollupRow => {
+    let row = map.get(key);
+    if (!row) {
+      row = { key, label, totalTokens: 0, activeMs: 0, ...emptyTotals() };
+      map.set(key, row);
+    }
+    return row;
+  };
+  const pushIval = (map: Map<string, Array<[number, number]>>, key: string, r: TurnUsageRecord): void => {
+    if (!r.atStart) return;
+    const s = Date.parse(r.atStart);
+    const e = Date.parse(r.at);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || e < s) return;
+    (map.get(key) || map.set(key, []).get(key)!).push([s, e]);
+    if (map === partyIvals) allIvals.push([s, e]);
+  };
+
+  for (const r of inRange) {
+    const tMs = bucketStartMs(Date.parse(r.at), bucketMinutes);
+    let bucket = bucketMap.get(tMs);
+    if (!bucket) {
+      bucket = { tMs, totals: emptyTotals(), bySeries: {}, byTrigger: {} };
+      bucketMap.set(tMs, bucket);
+    }
+    const skey = seriesKeyOf(r);
+    if (!bucket.bySeries[skey]) bucket.bySeries[skey] = emptyTotals();
+    addTurn(bucket.bySeries[skey], r);
+    addTurn(bucket.totals, r);
+    bucket.byTrigger[r.trigger] = (bucket.byTrigger[r.trigger] || 0) + turnTokensTotal(r.tokens);
+
+    const partyKey = r.partyId || "(none)";
+    addTurn(ensureRow(parties, partyKey, partyKey), r, midMs);
+    pushIval(partyIvals, partyKey, r);
+    if (r.member) {
+      const memberKey = `${partyKey}:${r.member}`;
+      const mrow = ensureRow(members, memberKey, r.member);
+      addTurn(mrow, r, midMs);
+      pushIval(memberIvals, memberKey, r);
+      // Latest model/effort wins (records are not guaranteed ordered). Skip
+      // gate-review turns: the reviewer is a separate agent on its own model, so
+      // its runtime must not masquerade as the member's dominant model/effort.
+      const t = Date.parse(r.at);
+      if (r.model && r.trigger !== "gate-review" && t >= (memberLastAt.get(memberKey) ?? -Infinity)) {
+        memberLastAt.set(memberKey, t);
+        mrow.lastModel = r.model;
+        mrow.lastEffort = r.effort;
+      }
+    }
+    addTurn(ensureRow(triggers, r.trigger, r.trigger), r, midMs);
+    pushIval(triggerIvals, r.trigger, r);
+    addTurn(totals, r, midMs);
+    if (r.trigger === "gate-review" && r.gate) {
+      // A failed review is counted separately, NOT as a review: folding it in
+      // would quietly shrink `rejectRate` (more denominator, same rejects) and
+      // read as "the gate is passing more", when in fact it did not run.
+      if (r.gate.failure) {
+        gateFailures += 1;
+        const layer = r.gate.failure.layer;
+        gateFailuresByLayer[layer] = (gateFailuresByLayer[layer] || 0) + 1;
+      } else {
+        gateReviews += 1;
+        if (r.gate.verdict === "reject") gateRejects += 1;
+      }
+      // Tokens count either way — a failed review can still have burned them.
+      gateReviewTokens += turnTokensTotal(r.tokens);
+    }
+  }
+
+  /** Fills totalTokens + derived (activeMs/cache/overhead/rate/trend) on a row. */
+  const finalize = (row: RollupRow, ivals?: Array<[number, number]>): RollupRow => {
+    row.totalTokens = row.input + row.cacheRead + row.cacheWrite + row.output;
+    row.activeMs = ivals ? unionMs(ivals) : 0;
+    const allInput = row.input + row.cacheRead + row.cacheWrite;
+    row.cacheHitRate = allInput > 0 ? row.cacheRead / allInput : undefined;
+    row.overheadRatio = row.totalTokens > 0 ? row.overheadTokens / row.totalTokens : undefined;
+    row.ratePerHour = row.activeMs > 0 ? row.totalTokens / (row.activeMs / 3_600_000) : undefined;
+    row.trendPct = row.firstHalfTokens > 0
+      ? (row.secondHalfTokens - row.firstHalfTokens) / row.firstHalfTokens * 100
+      : (row.secondHalfTokens > 0 ? 100 : undefined);
+    return row;
+  };
+
+  const byEst = (a: RollupRow, b: RollupRow) => b.effectiveCostUsd - a.effectiveCostUsd || b.output - a.output;
+  const partyRows = [...parties.values()].map((row) => finalize(row, partyIvals.get(row.key))).sort(byEst);
+  const memberRows = [...members.values()].map((row) => finalize(row, memberIvals.get(row.key))).sort(byEst);
+  const triggerRows = [...triggers.values()].map((row) => finalize(row, triggerIvals.get(row.key))).sort(byEst);
+  const totalTokens = totals.input + totals.cacheRead + totals.cacheWrite + totals.output;
+  const activeMsUnion = unionMs(allIvals);
+  return {
+    fromMs,
+    toMs,
+    bucketMinutes,
+    partyId,
+    buckets: [...bucketMap.values()].sort((a, b) => a.tMs - b.tMs),
+    parties: partyRows,
+    members: memberRows,
+    triggers: triggerRows,
+    totals,
+    totalTokens,
+    activeMsUnion,
+    ratePerHour: activeMsUnion > 0 ? totalTokens / (activeMsUnion / 3_600_000) : undefined,
+    overheadRatio: totalTokens > 0 ? totals.overheadTokens / totalTokens : undefined,
+    gate: gateReviews > 0 || gateFailures > 0
+      ? {
+          reviews: gateReviews,
+          rejects: gateRejects,
+          rejectRate: gateReviews > 0 ? gateRejects / gateReviews : 0,
+          reviewTokens: gateReviewTokens,
+          netTokens: -gateReviewTokens,
+          failures: gateFailures,
+          // Share of attempts that never reached a verdict — the number that
+          // says how much of the gate is actually running.
+          failureRate: gateReviews + gateFailures > 0 ? gateFailures / (gateReviews + gateFailures) : 0,
+          failuresByLayer: gateFailuresByLayer,
+        }
+      : undefined,
+    recordCount: inRange.length,
+  };
+}

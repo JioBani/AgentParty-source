@@ -1,0 +1,176 @@
+import { setConsoleLogging } from "../../logger";
+import { setHostDistro } from "../../hostIdentity";
+import { installCrashHandlers } from "../../crashHandler";
+import { createEngineHost } from "../engineHost";
+import { AppController } from "../../application/appController";
+import { AutomationApiServer } from "../../automationApi";
+import { WindowRegistry } from "../../windowRegistry";
+import { serveEngine } from "./engineServer";
+import { HostChannel } from "./hostChannel";
+import { writeLine } from "./rpc";
+import type { GateReviewResult } from "../../../shared/messageGate";
+import { DEEPSEEK_API_KEY_ENV } from "../../../shared/deepseekDefaults";
+import { partyBridgeFromInvoker } from "../../../core/partyBridge";
+
+/**
+ * Standalone engine server: builds an Electron-free engine host and serves one
+ * workspace's engine over stdin/stdout. Spawned as a child by the desktop
+ * client — locally as `node engineServerEntry`, and (Stage 5) inside a distro as
+ * `wsl.exe -d <distro> -e node engineServerEntry`. stdout is the RPC channel, so
+ * console logging is disabled (file logging continues). See the WSL remote-engine design.
+ *
+ * Args: --workspace <path> --storage <dir> [--distro <name>]
+ */
+function arg(name: string): string {
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 ? process.argv[index + 1] || "" : "";
+}
+
+async function main(): Promise<void> {
+  setConsoleLogging(false);
+
+  const workspace = arg("workspace") || process.cwd();
+  const storage = arg("storage") || workspace;
+  // Which distro this engine IS. A member pinned to another one must not start
+  // here just because the path happens to exist in both.
+  setHostDistro(arg("distro") || undefined);
+
+  // This process runs a WSL workspace's whole engine with NO window attached, so
+  // a crash here is even less visible than one in the desktop: nobody sees a
+  // window vanish, the workspace simply stops answering. `logCritical` writes to
+  // stderr, which the spawning desktop already captures into its own log
+  // (wslEngine.ts), so one record lands on both sides of the boundary.
+  //
+  // No teardown on the way out: `shutdown()` disposes an engine whose state the
+  // crash just invalidated. Exit honestly instead.
+  installCrashHandlers({
+    exit: (code) => process.exit(code),
+    describeContext: () => ({ runtime: "engine-server", uptimeSec: Math.round(process.uptime()) }),
+  });
+
+  // The Message Gate reviewer is the one piece of engine work that CANNOT run
+  // here: it talks to the subscription bridge / embedded router, both bound to
+  // the desktop's 127.0.0.1, which from inside a distro is the distro's own
+  // loopback. Delegating it upward keeps the verdict, badge and rejection record
+  // in this engine (where the party state lives) while the credentialed HTTP call
+  // stays on the host. Without this the review throws on every message and the
+  // fail-open policy delivers them all unreviewed.
+  const hostChannel = new HostChannel(process.stdout);
+  const host = createEngineHost({
+    storageDir: storage,
+    // Every WSL workspace has its own engine process but shares the distro-level
+    // storage root. Include the workspace so discovery/usage helpers in two
+    // simultaneously open workspaces cannot fall back onto one SQLite DB.
+    runtimeScope: `workspace:${workspace}`,
+    router: {
+      preferredPort: 0,
+      authToken: "engine",
+      openRouterApiKey: process.env.OPENROUTER_API_KEY || "",
+      deepseekApiKey: process.env[DEEPSEEK_API_KEY_ENV] || "",
+      // Cursor-subscription cross-harness models run HERE (the distro owns the
+      // cursor-agent login), unlike the gate reviewer which must run upward.
+      cursorAcpRelayScriptPath: process.env.AGENTPARTY_ACP_RELAY_SCRIPT || undefined,
+    },
+    reviewGate: (message, reviewer) => hostChannel.call<GateReviewResult>("reviewGate", message, reviewer),
+    createHostedPartyBridge: (binding) => partyBridgeFromInvoker((tool, args) =>
+      hostChannel.call("partyTool", binding.ownerWorkspace, binding.identity.member, tool, args, binding.identity.party)),
+    // The Discord bridge is desktop-owned for the same reason as the gate: it
+    // holds the bot token and one long-lived gateway socket, and the desktop —
+    // not this distro — is what the user configured. Delegating upward keeps a
+    // WSL member's discord-* tools working instead of reporting "unavailable".
+    discord: {
+      connectMember: (input) => hostChannel.call("discordConnect", input),
+      sendAsMember: (workspacePath, party, member, content) => hostChannel.call("discordSend", workspacePath, party, member, content),
+      // Only the decoded bytes cross the boundary: the file path exists inside
+      // this distro, and the upload has to happen where the token is.
+      sendImageAsMember: (workspacePath, party, member, image, caption) =>
+        hostChannel.call("discordSendImage", workspacePath, party, member, image, caption),
+      disconnectMember: (workspacePath, party, member) => hostChannel.call("discordDisconnect", workspacePath, party, member),
+    },
+  });
+  // Start the embedded router so router-backed models (MiniMax M3, etc.) work —
+  // it runs inside the distro alongside the harness. preferredPort 0 binds a
+  // free port; without this the harness sees the router at 127.0.0.1:0.
+  await host.startRouter();
+  const engine = host.engineRegistry.forWorkspace(workspace);
+
+  // Codex party tools reach the app through the local automation HTTP API. In a
+  // headless engine (e.g. inside a WSL distro), the desktop's automation API is
+  // NOT reachable across the process/network boundary — 127.0.0.1 there is the
+  // distro loopback, not the Windows host — so a Codex member's party MCP server
+  // gets "-32603: fetch failed" on every tool. Serve the SAME automation surface
+  // locally on the distro's loopback and hand its real URL to the harness. The
+  // worker owns execution sessions, not party state: identity-bound party-tool
+  // calls are forwarded over `remotePartyTool` to the desktop's Windows-global
+  // AppController. Its workspace-local files may be a migration source and must
+  // never shadow newer global members. An empty WindowRegistry is correct
+  // headless: there are no windows to broadcast to, and `defaultWorkspace`
+  // resolves non-party execution requests to the one workspace served here.
+  const windowRegistry = new WindowRegistry();
+  let automationApi: AutomationApiServer | undefined;
+  const appController = new AppController({
+    sessionManager: host.sessionManager,
+    engineRegistry: host.engineRegistry,
+    windowRegistry,
+    getRouterBaseUrl: () => host.router.baseUrl,
+    getAutomationBaseUrl: () => automationApi?.baseUrl || "",
+    remotePartyTool: (ownerWorkspace, member, tool, args, partyId) =>
+      hostChannel.call("partyTool", ownerWorkspace, member, tool, args, partyId),
+    openWindow: () => Promise.reject(new Error("openWindow is not supported in the headless engine server")),
+    onSettingsChanged: () => undefined,
+    onWorkspacesChanged: () => undefined,
+    // Appearance is desktop-owned (window chrome + the host's settings.json).
+    // Forward rather than writing this process's settings file, which lives in
+    // the distro and would never reach a window.
+    appearanceRemote: {
+      getAppearance: () => hostChannel.call("appearanceGet"),
+      setTheme: (theme) => hostChannel.call("appearanceSet", theme),
+    },
+  });
+  automationApi = new AutomationApiServer({ port: 0, controller: appController, windowRegistry, defaultWorkspace: workspace });
+  await automationApi.start();
+  // Bake the ACTUAL bound URL into every Codex session this engine spawns, so the
+  // in-distro party MCP server fetches a live local endpoint (never 127.0.0.1:0).
+  host.sessionManager.setAutomationBaseUrlProvider(() => automationApi?.baseUrl);
+
+  serveEngine(engine, process.stdin, process.stdout, hostChannel);
+
+  // Push this workspace's live session activity to the client over the same
+  // channel (distinguished from RPC responses by `kind: "event"`).
+  host.sessionManager.on("events", (payload) => writeLine(process.stdout, { kind: "event", channel: "session:events", payload }));
+  host.sessionManager.on("snapshot", (payload) => writeLine(process.stdout, { kind: "event", channel: "session:snapshot", payload }));
+  host.sessionManager.on("sessions", (payload) => writeLine(process.stdout, { kind: "event", channel: "session:sessions", payload }));
+  // A member drove a party tool inside this engine (member-create / send /
+  // remove). Signal the client so it re-fetches and re-broadcasts party state —
+  // without this, agent-driven party changes never reach a remote workspace's UI.
+  host.sessionManager.on("party", (payload) => writeLine(process.stdout, { kind: "event", channel: "party:changed", payload }));
+  // Codex model discovery settled inside this engine — signal the client so it
+  // re-fetches routes and pushes models:update (same rule: no silent state).
+  host.sessionManager.on("codex-models", (payload) => writeLine(process.stdout, { kind: "event", channel: "codex-models:changed", payload }));
+  // Provider rate-limit usage changed inside this engine (Claude rate_limit_event
+  // / Codex account/rateLimits/updated). These limits are account-global, so the
+  // client merges them into its own snapshot — without this the desktop's usage
+  // indicator for a WSL workspace is stuck on "불러오는 중…" forever.
+  host.sessionManager.on("usage", (payload) => writeLine(process.stdout, { kind: "event", channel: "usage", payload }));
+
+  const shutdown = () => {
+    appController.dispose();
+    hostChannel.dispose();
+    automationApi?.dispose();
+    host.dispose();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+  process.stdin.on("close", shutdown);
+
+  // Readiness handshake on stderr (stdout is reserved for RPC). The in-distro
+  // automation base URL is appended for diagnostics/tests; existing readers match
+  // the token with `includes()`, so the suffix is backwards-compatible.
+  process.stderr.write(`ENGINE_SERVER_READY ${automationApi.baseUrl}\n`);
+}
+
+main().catch((error) => {
+  process.stderr.write(`ENGINE_SERVER_ERROR ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+});

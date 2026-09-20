@@ -1,0 +1,1486 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, IpcMainInvokeEvent, Menu, safeStorage, screen, shell, type WebContents } from "electron";
+import { EmbeddedHarnessRouter } from "../core/routerShim";
+import { AutomationApiServer } from "./automationApi";
+import { initLogger, log, setDebugLoggingEnabled } from "./logger";
+import { installCrashHandlers } from "./crashHandler";
+import { getPublicSettings, getSettings, storedThemePreference, updateSettings } from "./settings";
+import { appearanceBootArgs, normalizeThemePreference, windowBackgroundFor } from "../shared/appTheme";
+import { SessionManager } from "./sessionManager";
+import { AppController } from "./application/appController";
+import { launchCliContinuation } from "./cliContinuationLauncher";
+import { WorkspaceManager } from "./workspaceManager";
+import { createEngineHost } from "./engine/engineHost";
+import type { EngineRegistry } from "./engine/engineRegistry";
+import { spawnWslEngine } from "./engine/transport/wslEngine";
+import { spawnSshEngine } from "./engine/transport/sshEngine";
+import { RemoteEngineClient } from "./engine/transport/remoteEngineClient";
+import { setUserDataDir } from "./userDataDir";
+import { startRemoteModelCatalog } from "./remoteModelCatalog";
+import { parseWorkspaceLocation, serializeWorkspaceLocation, workspaceArgFromArgv } from "../shared/workspaceLocation";
+import { WindowRegistry } from "./windowRegistry";
+import type { MemberPermissionInput, MemberRuntimeInput, SessionView, StartPartyMemberInput, TranscriptSave, WindowInfo } from "../shared/types";
+import { workspaceKey } from "../shared/workspaceLocation";
+import { sessionsForWindow } from "./sessionListRouting";
+import { writeInstanceDiscovery, removeInstanceDiscovery } from "./discovery";
+import { sanitizeAttachments } from "../shared/attachments";
+import { parseQueueCommand } from "../shared/messageQueue";
+import type { UsageLimitsSnapshot } from "../shared/usageLimits";
+import { SubscriptionProxyService } from "./subscriptionProxyService";
+import { subscriptionProxyConfig } from "../core/subscriptionProxy";
+import { reviewGateMessage, type GateReviewMessage } from "../core/messageGateReviewer";
+import type { GateReviewer } from "../shared/messageGate";
+import { DiscordBridgeService } from "./discordBridgeService";
+import { UpdateService } from "./updateService";
+import { DiscordControlService } from "./discordControl";
+import { loadDotEnv } from "./dotenv";
+import { DEEPSEEK_API_KEY_ENV } from "../shared/deepseekDefaults";
+import { BAI_API_KEY_ENV } from "../shared/baiDefaults";
+import { ApprovalIndex } from "./approvalIndex";
+import { GuideScreenHost } from "./guideScreen";
+import { GuideChatHost, requireChatKind } from "./guideChat";
+import { SshServerStore } from "./ssh/sshServerStore";
+import { SshServerService } from "./ssh/sshServerService";
+import { Ssh2Transport } from "./ssh/ssh2Transport";
+import { parseMemberLocation, serializeMemberLocation } from "../shared/memberLocation";
+import { renameSshRecentServer } from "./cwdPreferencesStore";
+import { memberExecutionLocationCatalog } from "../shared/memberLocation";
+import { getCheckedCwdPreferences, rememberCwd } from "./cwdPreferencesStore";
+
+// Let webContents.capturePage() return real pixels even when the window is
+// occluded / behind other windows — the automation /api/capture relies on this
+// for headless QA. Chromium's "native window occlusion" marks covered windows
+// hidden and stops painting them, so capturePage yields an empty (0x0) image on
+// Windows; disabling it (plus the occluded/renderer backgrounding switches)
+// keeps frames flowing for a backgrounded window. See electron/electron#31992.
+// Must run before app `ready` — module load is early enough.
+app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
+app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+app.commandLine.appendSwitch("disable-renderer-backgrounding");
+if (process.env.AGENTPARTY_DISABLE_GPU === "1") {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-gpu");
+}
+if (process.env.AGENTPARTY_USER_DATA) {
+  app.setPath("userData", process.env.AGENTPARTY_USER_DATA);
+}
+
+// Installed at module load, before anything else can fail: a handler registered
+// later cannot record what already went wrong. `app.exit` (not `app.quit`) is
+// the terminator — quit is cooperative and can be blocked by the very state the
+// crash just broke. Context is counts only; see CrashContext.
+installCrashHandlers({
+  exit: (code) => app.exit(code),
+  describeContext: () => ({
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    uptimeSec: Math.round(process.uptime()),
+    windows: windowRegistry?.list().length ?? 0,
+    sessions: sessionManager?.listSessions().length ?? 0,
+  }),
+});
+
+// AgentParty runs as ONE process with MANY windows — any window on any
+// workspace, any party. A second launch becomes a window here (see the
+// single-instance lock at the bottom of this file).
+//
+// This reverses 5608fd5 ("remove single-instance lock", 2026-07-07), which
+// dropped the lock because it stopped a user from opening the same cwd twice —
+// at the time the only way to run two parties side by side was to run two apps.
+// Multi-window removes that need, and the multi-process shape turned out to cost
+// far more than it bought: session ids are per-process while the party store is
+// shared on disk, so two processes on one workspace could not see each other's
+// sessions and each started its own harness for the same member. Measured on a
+// live install before the fix: one member holding EIGHT `claude` processes on
+// the same conversation, ~2.5 GB, still climbing hours later.
+//
+// Party/group/member state has one Windows-global source of truth. Per-workspace
+// discovery remains only for standalone sessions, native CLI/auth context and
+// the explicit lazy import of an older cwd-owned party store. A party member's
+// immutable location decides whether its harness runs on Windows or in WSL.
+
+let router: EmbeddedHarnessRouter | undefined;
+let sessionManager: SessionManager | undefined;
+let workspaceManager: WorkspaceManager | undefined;
+let windowRegistry: WindowRegistry | undefined;
+let automationApi: AutomationApiServer | undefined;
+let appController: AppController | undefined;
+let discordBridge: DiscordBridgeService | undefined;
+let engineRegistry: EngineRegistry | undefined;
+let subscriptionProxyService: SubscriptionProxyService | undefined;
+let updateService: UpdateService | undefined;
+let sshServerService: SshServerService | undefined;
+/** Internal Windows directory whose engine is the party-state source of truth. */
+let partyStorageWorkspace: string | undefined;
+/** Last session list from each WSL worker, merged with desktop-owned party sessions. */
+const remoteSessionsByWorkspace = new Map<string, SessionView[]>();
+/**
+ * Which session raised each approval. Built here because this is where BOTH
+ * local and WSL engine events pass, which is what lets a phone answer an
+ * approval raised inside a distro without knowing that is where it lives.
+ */
+const approvals = new ApprovalIndex();
+let guideScreen: GuideScreenHost | undefined;
+let guideChat: GuideChatHost | undefined;
+
+/**
+ * Workspace from `--workspace <uri>` in a process argv. Used both by the initial
+ * launch (`agent-party` CLI, Explorer "open here") and by the single-instance
+ * `second-instance` handler that receives the new process's argv.
+ */
+function workspaceFromArgv(argv: string[]): string | undefined {
+  // Pure resolution lives in the shared, unit-tested `workspaceArgFromArgv`; here
+  // we only surface its warning (a launcher that dropped the folder path, or a
+  // non-absolute value) so it never silently opens a fabricated workspace.
+  const { location, warning } = workspaceArgFromArgv(argv);
+  if (warning) {
+    log("warn", "window", warning, { argv: argv.slice(1) });
+  }
+  return location;
+}
+
+/** The guide screen host, or an explicit error — never a silent no-op. */
+function requireGuideScreen(): GuideScreenHost {
+  if (!guideScreen) {
+    throw new Error("가이드 화면 호스트가 아직 없습니다.");
+  }
+  return guideScreen;
+}
+
+/** The guide chat host, or an explicit error — never a silent no-op. */
+function requireGuideChat(): GuideChatHost {
+  if (!guideChat) {
+    throw new Error("가이드 채팅이 아직 없습니다.");
+  }
+  return guideChat;
+}
+
+/** The Discord bridge, or an explicit error — never a silent no-op. */
+function requireBridge(): DiscordBridgeService {
+  if (!discordBridge) {
+    throw new Error("The Discord bridge is not available on the desktop.");
+  }
+  return discordBridge;
+}
+
+function launchWorkspace(): string | undefined {
+  return workspaceFromArgv(process.argv);
+}
+
+/**
+ * Positions a new window on a chosen monitor when `AGENTPARTY_WINDOW_DISPLAY` is
+ * set (`left` | `right` | a display index). Used by QA/e2e so the real window
+ * opens on the left monitor and doesn't cover the user's other monitor. No-op
+ * (normal launch behavior) when the env var is absent.
+ */
+function placeWindowOnDisplay(window: BrowserWindow): void {
+  const target = process.env.AGENTPARTY_WINDOW_DISPLAY;
+  if (!target) {
+    return;
+  }
+  try {
+    const displays = [...screen.getAllDisplays()].sort((a, b) => a.bounds.x - b.bounds.x);
+    if (displays.length === 0) {
+      return;
+    }
+    const index = Number(target);
+    const display = Number.isInteger(index) ? displays[Math.max(0, Math.min(index, displays.length - 1))]
+      : target === "right" ? displays[displays.length - 1]
+      : displays[0];
+    const area = display.workArea;
+    const [w, h] = window.getSize();
+    const width = Math.min(w, area.width);
+    const height = Math.min(h, area.height);
+    const x = Math.round(area.x + Math.max(0, (area.width - width) / 2));
+    const y = Math.round(area.y + Math.max(0, (area.height - height) / 2));
+    window.setBounds({ x, y, width, height });
+    log("info", "window", "positioned on display", { target, x, y, width, height });
+  } catch (error) {
+    log("warn", "window", "display positioning failed", { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+function defaultWorkspace(): string {
+  return getSettings().workspacePath || process.cwd();
+}
+
+function appearanceBootForWindow() {
+  const stored = storedThemePreference();
+  const preference = stored ?? normalizeThemePreference(getSettings().theme);
+  return { preference, applied: preference, stored: stored !== undefined };
+}
+
+/** Reveals a window after appearance boot. Keyed by webContents so every createWindow path shares one show. */
+const revealByContents = new WeakMap<WebContents, () => void>();
+
+async function createWindow(workspacePath: string): Promise<WindowInfo> {
+  const boot = appearanceBootForWindow();
+  const window = new BrowserWindow({
+    width: 1480,
+    height: 960,
+    minWidth: 1100,
+    minHeight: 720,
+    title: "AgentParty",
+    icon: path.join(app.getAppPath(), "build", "icon.png"),
+    show: false,
+    backgroundColor: windowBackgroundFor(boot.preference),
+    titleBarStyle: "hidden",
+    frame: false,
+    webPreferences: {
+      preload: path.join(__dirname, "../preload/preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      additionalArguments: appearanceBootArgs(boot),
+      // Keep painting when backgrounded so /api/capture works off-foreground.
+      backgroundThrottling: false,
+    },
+  });
+
+  placeWindowOnDisplay(window);
+
+  // With backgroundThrottling off, a minimized/hidden window keeps painting at
+  // full rate and its page never reports "hidden". Tell the renderer so it can
+  // pause decorative animations nobody can see (they otherwise keep the
+  // renderer producing frames continuously).
+  const sendRenderState = () => {
+    if (!window.isDestroyed()) {
+      window.webContents.send("window:render-state", { occluded: window.isMinimized() || !window.isVisible() });
+    }
+  };
+  window.on("minimize", sendRenderState);
+  window.on("restore", sendRenderState);
+  window.on("hide", sendRenderState);
+  window.on("show", sendRenderState);
+  // A pause that never lifts looks exactly like the app hanging, so re-check on
+  // focus too: it costs one no-op send, and it means any restore path that fails
+  // to emit restore/show cannot strand every animation in the window as paused.
+  window.on("focus", sendRenderState);
+
+  const entry = registry().register(window, workspacePath);
+  window.on("closed", () => {
+    log("info", "window", "window closed", { id: entry.id });
+    // Drop this window's per-window active-party entry so it can't leak to a
+    // future window that happens to reuse the id.
+    appController?.forgetWindow(entry.id);
+    // Last window for this workspace → tear down its engine (kills a WSL child)
+    // and drop its discovery entry.
+    if (registry().forWorkspace(entry.workspacePath).length === 0) {
+      engineRegistry?.dispose(entry.workspacePath);
+      remoteSessionsByWorkspace.delete(workspaceKey(entry.workspacePath));
+    }
+    reconcileDiscovery();
+  });
+  // Advertise this workspace as served by this process (once the API is up).
+  reconcileDiscovery();
+
+  let revealed = false;
+  const reveal = () => {
+    if (revealed || window.isDestroyed()) return;
+    revealed = true;
+    window.show();
+    window.focus();
+  };
+  revealByContents.set(window.webContents, reveal);
+
+  const rendererUrl = process.env.AGENTPARTY_RENDERER_URL;
+  guardNavigation(window, rendererUrl);
+  if (rendererUrl) {
+    await window.loadURL(rendererUrl);
+    window.webContents.openDevTools({ mode: "detach" });
+  } else {
+    await window.loadFile(path.join(__dirname, "../../dist-renderer/index.html"));
+  }
+  // Hidden until the renderer commits appearance. Fallback so a failed
+  // bootstrap cannot leave a window that never appears.
+  setTimeout(reveal, 8000);
+  log("info", "window", "window created", { id: entry.id, workspacePath: entry.workspacePath });
+  return { id: entry.id, workspacePath: entry.workspacePath, focused: true };
+}
+
+/**
+ * Keeps every link OUT of the app window.
+ *
+ * The renderer already hands `http(s)` markdown links to `shell.openExternal`,
+ * but that check is `^https?://` and a model writes plenty that miss it —
+ * `[docs](example.com)`, `[readme](./docs/API.md)`, a `mailto:`. Those reach
+ * Electron as an ordinary anchor with `target="_blank"`, and Electron's DEFAULT
+ * for an unhandled `window.open` is to create a real BrowserWindow: the link
+ * opens inside the app, in a frameless chrome-less window, with no way back.
+ * A link without the blank target is worse — it navigates the workbench itself
+ * away and takes the running party's UI with it.
+ *
+ * So the boundary is closed here, in main, rather than by widening the renderer
+ * check. The renderer cannot be the only guard: it only sees clicks on the
+ * anchors IT renders, while this covers every route into a navigation (a
+ * dropped URL, a middle-click, a page script) including ones no component
+ * knows about.
+ *
+ * `http(s)` and `mailto:` go to the OS. Everything else is refused and LOGGED —
+ * a link that silently does nothing is its own bug report, and the log is what
+ * tells the next person which scheme to add.
+ */
+function guardNavigation(window: BrowserWindow, rendererUrl: string | undefined): void {
+  const openExternally = (target: string, via: string): boolean => {
+    if (/^(https?|mailto):/i.test(target)) {
+      void shell.openExternal(target).catch((error) => {
+        log("error", "window", "could not hand a link to the OS", { target, via, error: error instanceof Error ? error.message : String(error) });
+      });
+      log("info", "window", "link opened in the default app", { target, via });
+      return true;
+    }
+    log("warn", "window", "link refused: unsupported scheme", { target, via });
+    return false;
+  };
+
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    openExternally(url, "window-open");
+    // Always deny. Even an http(s) target has already been handed to the OS, and
+    // letting Electron ALSO open it would produce the very window this prevents.
+    return { action: "deny" };
+  });
+
+  window.webContents.on("will-navigate", (event, url) => {
+    // The app loading (or hot-reloading) itself is not a link click. Compare
+    // origins so a dev server's HMR navigation is allowed while any other host
+    // — including a `file://` the app bundle happens to resolve — is not.
+    if (sameOrigin(url, rendererUrl || window.webContents.getURL())) {
+      return;
+    }
+    event.preventDefault();
+    openExternally(url, "will-navigate");
+  });
+}
+
+/** Whether two URLs share an origin; unparseable input is never "same". */
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    // `file://` URLs all report origin "null", so compare the protocol instead:
+    // a packaged app loads its renderer from file:// and must keep working.
+    return left.protocol === "file:" && right.protocol === "file:" ? true : left.origin === right.origin;
+  } catch {
+    return false;
+  }
+}
+
+async function bootstrap(): Promise<void> {
+  setUserDataDir(app.getPath("userData"));
+  initLogger();
+  // Development/QA convenience: a .env next to the app fills env vars that are
+  // not already set (e.g. DISCORD_BOT_TOKEN). Logged so a credential's origin is
+  // never a mystery. Production credentials live in settings.json.
+  const dotEnvKeys = loadDotEnv(app.getAppPath());
+  if (dotEnvKeys.length) {
+    log("info", "env", ".env values loaded", { keys: dotEnvKeys });
+  }
+  const settings = getSettings();
+  setDebugLoggingEnabled(settings.debugEnabled);
+  subscriptionProxyService = new SubscriptionProxyService({
+    storageDir: app.getPath("userData"),
+    resourcesPath: process.resourcesPath,
+    packaged: app.isPackaged,
+  });
+  const subscriptionStatus = await subscriptionProxyService.ensureRunning();
+  subscriptionProxyService.startMonitoring();
+  log(subscriptionStatus.ok ? "info" : "error", "subscription-proxy", "automatic subscription bridge check completed", {
+    ok: subscriptionStatus.ok,
+    baseUrl: subscriptionStatus.baseUrl,
+    detail: subscriptionStatus.service?.detail || subscriptionStatus.detail,
+  });
+  const acpRelayScript = app.isPackaged
+    ? path.join(process.resourcesPath, "bin", "agentparty-acp-mcp-relay.mjs")
+    : path.join(app.getAppPath(), "scripts", "agentparty-acp-mcp-relay.mjs");
+  // The Discord bridge: outbound is the member's MCP tools, inbound is injected
+  // through the ordinary party-message path so an idle member is woken and a busy
+  // one queues it. See docs/기획 노트.md §11.
+  discordBridge = new DiscordBridgeService({
+    deliver: async ({ binding, authorName, content, attachments }) => {
+      if (!appController) {
+        return { delivered: false, error: "app is still starting" };
+      }
+      // Same wrapper convention as party messages, so a member reads its origin.
+      // An image-only message still needs a body: an empty turn reads as "the
+      // user said nothing" rather than "look at this".
+      const body = content.trim() || `(이미지 ${attachments?.length || 0}장)`;
+      const wrapped = `<channel source="discord" from="${authorName}">
+${body}
+</channel>`;
+      try {
+        // interrupt: a person typed this from their phone and is waiting. Queuing
+        // it behind a long autonomous turn would swallow the instruction for
+        // minutes; the adapters' queued-turn drain delivers it once the interrupt
+        // settles (a compaction is never torn down — see sendUserMessage).
+        const result: any = await appController.sendMemberMessage(
+          binding.workspacePath,
+          binding.member,
+          wrapped,
+          attachments,
+          undefined,
+          { interrupt: true },
+          binding.party,
+        );
+        const delivered = result?.partyMessage?.delivered ?? result?.delivered ?? true;
+        return { delivered: Boolean(delivered), error: result?.partyMessage?.error || result?.error };
+      } catch (error) {
+        return { delivered: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    onStatusChanged: (status) => {
+      for (const entry of registry().all()) {
+        entry.window.webContents.send("discord:update", status);
+      }
+    },
+    log: (message) => log("info", "discord", message),
+    // Identifies this process run on a machine where several instances share
+    // userData; bindings record it so exactly one of them delivers (§11.14).
+    instance: { pid: process.pid, startedAt: discoveryStartedAt },
+    // Harness truth behind the delivery receipt: turnCount rises when the message
+    // is really submitted to the model, so "received" is observed, not promised.
+    memberTurn: async (binding) => {
+      const status: any = await controller().handlePartyAction(binding.workspacePath, binding.member, "status", {}, undefined, binding.party);
+      const entry = Array.isArray(status?.members) ? status.members.find((m: any) => m?.name === binding.member) : undefined;
+      return { turnCount: Number(entry?.turnCount) || 0, turnActive: Boolean(entry?.turnActive) };
+    },
+  });
+  // The control panel: mechanical commands typed in Discord, executed through the
+  // same AppController methods the UI and HTTP use. Wired after construction
+  // because the two reference each other.
+  discordBridge.setControl(new DiscordControlService({
+    bridge: () => requireBridge(),
+    log: (message) => log("info", "discord", message),
+    app: {
+      // Only workspaces with an open window: a command must act on what this
+      // instance is actually running, not on every folder it has ever opened.
+      workspaces: () => [...new Set(registry().all().map((entry) => entry.workspacePath))],
+      listParties: async (workspacePath) => {
+        const listing: any = await controller().listPartyMembers(workspacePath);
+        const members: any[] = Array.isArray(listing?.members) ? listing.members : [];
+        return (Array.isArray(listing?.parties) ? listing.parties : []).map((party: any) => ({
+          id: String(party?.id || ""),
+          name: String(party?.name || party?.id || ""),
+          memberCount: members.filter((member) => member?.partyId === party?.id).length,
+        }));
+      },
+      listMembers: async (workspacePath, partyId) => {
+        const listing: any = await controller().listPartyMembers(workspacePath, undefined, partyId);
+        return (Array.isArray(listing?.members) ? listing.members : [])
+          .filter((member: any) => !member?.partyId || member.partyId === partyId)
+          .map((member: any) => ({
+            name: String(member?.name || ""),
+            status: String(member?.status || "unknown"),
+            model: member?.model ? String(member.model) : undefined,
+            runtime: member?.runtime ? String(member.runtime) : undefined,
+          }));
+      },
+      interruptMember: async (workspacePath, partyId, member) => {
+        const result: any = await controller().handlePartyAction(workspacePath, member, "interrupt", {}, undefined, partyId);
+        return { interrupted: Boolean(result?.interrupted), message: String(result?.message || "") };
+      },
+      respawnMember: async (workspacePath, partyId, member) => {
+        const result: any = await controller().handlePartyAction(workspacePath, member, "respawn", {}, undefined, partyId);
+        return { message: String(result?.message || "") };
+      },
+    },
+  }));
+  const host = createEngineHost({
+    storageDir: app.getPath("userData"),
+    runtimeScope: "desktop",
+    router: {
+      preferredPort: parsePort(settings.routerBaseUrl),
+      authToken: settings.routerAuthToken,
+      openRouterApiKey: settings.openRouterApiKey || process.env.OPENROUTER_API_KEY || "",
+      deepseekApiKey: settings.deepseekApiKey || process.env[DEEPSEEK_API_KEY_ENV] || "",
+      cursorAcpRelayScriptPath: acpRelayScript,
+      cursorExecutablePath: () => getSettings().cursorExecutablePath || undefined,
+    },
+    // Members reach Discord through their party tools; the bridge itself is
+    // desktop-owned (it holds the token and the gateway socket).
+    discord: discordBridge,
+    executionLocations: {
+      list: async () => memberExecutionLocationCatalog(await getCheckedCwdPreferences()),
+      check: async (location) => {
+        const serialized = serializeMemberLocation(location);
+        // Party MCP and the visible member wizard must ask the same controller
+        // question. In particular, SSH paths are checked on their registered
+        // server rather than falling through to the desktop filesystem.
+        const checked = await controller().checkCwd(location);
+        return checked.usable
+          ? { location, serialized }
+          : { location, serialized, problem: checked.problem };
+      },
+      remember: (location) => {
+        rememberCwd(location);
+        applyRuntimeSettings();
+      },
+      sshUnavailable: (location) => {
+        if (location.env !== "ssh" || !location.server) return undefined;
+        return sshServerService
+          ? sshServerService.messageUnavailable(location.server)
+          : { server: location.server, problem: "unreachable" };
+      },
+      ensureSshAvailable: async (location) => {
+        if (location.env !== "ssh" || !location.server) return undefined;
+        return sshServerService
+          ? sshServerService.ensureMessageAvailable(location.server)
+          : { server: location.server, problem: "unreachable" };
+      },
+    },
+    // Desktop only: a remote workspace is served by an engine spawned in its host.
+    createRemoteEngine: (location, serialized) => {
+      if (location.host.kind !== "wsl" && location.host.kind !== "ssh") {
+        throw new Error(`Unsupported remote host for '${serialized}'.`);
+      }
+      // In a packaged app the bundle is asar-unpacked (external wsl.exe/cp can't
+      // read inside app.asar); use the on-disk unpacked path. No-op in dev.
+      const serverBundle = path
+        .join(__dirname, "../engine-server.mjs")
+        .replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+      const codexMcpServer = app.isPackaged
+        ? path.join(process.resourcesPath, "bin", "agentparty-codex-mcp-server.mjs")
+        : path.join(app.getAppPath(), "scripts", "agentparty-codex-mcp-server.mjs");
+      const handle = location.host.kind === "wsl"
+        ? spawnWslEngine({
+          distro: location.host.distro,
+          workspacePosix: location.path,
+          serverBundleWinPath: serverBundle,
+          codexMcpServerWinPath: codexMcpServer,
+          acpRelayWinPath: acpRelayScript,
+          openRouterApiKey: getSettings().openRouterApiKey || process.env.OPENROUTER_API_KEY || "",
+          deepseekApiKey: getSettings().deepseekApiKey || process.env[DEEPSEEK_API_KEY_ENV] || "",
+          baiApiKey: getSettings().baiApiKey || process.env[BAI_API_KEY_ENV] || "",
+        })
+        : spawnSshEngine({
+          server: location.host.server,
+          workspacePosix: location.path,
+          serverBundlePath: serverBundle,
+          codexMcpServerPath: codexMcpServer,
+          service: sshServerService || (() => { throw new Error("SSH server service is not ready."); })(),
+        });
+      const client = new RemoteEngineClient(handle.transport, serialized, handle.dispose, {
+        // The distro engine owns the gate decision but cannot reach a provider:
+        // the subscription bridge and embedded router bind THIS host's loopback.
+        // Run the reviewer call here and hand the verdict back, so credentials
+        // stay on the desktop and the listeners stay closed.
+        // A distro member drove a discord-* tool: run it on the desktop, where the
+        // token and the gateway socket live.
+        //
+        // The workspace path is ALWAYS this connection's `serialized` URI
+        // (`wsl+Ubuntu:/path`), never what the engine reported. Inside the distro
+        // the workspace is a bare posix path, so trusting it would key the same
+        // member two different ways — the desktop's HTTP path and the member's own
+        // tool would then bind two separate channels for one member. (Observed:
+        // the WSL e2e created a duplicate channel and the agent posted into it.)
+        discordConnect: (input: any) => requireBridge().connectMember({ ...input, workspacePath: partyStorageWorkspace || serialized }),
+        discordSend: (_workspacePath: string, party: string, member: string, content: string) =>
+          requireBridge().sendAsMember(partyStorageWorkspace || serialized, party, member, content),
+        discordSendImage: (_workspacePath: string, party: string, member: string, image: any, caption?: string) =>
+          requireBridge().sendImageAsMember(partyStorageWorkspace || serialized, party, member, image, caption),
+        discordDisconnect: async (_workspacePath: string, party: string, member: string) =>
+          requireBridge().disconnectMember(partyStorageWorkspace || serialized, party, member),
+        // A member harness hosted in this distro still belongs to a party whose
+        // state lives in the desktop engine. Execute every party tool through
+        // the same AppController path used by UI and HTTP automation.
+        partyTool: (ownerWorkspace: string, member: string, tool: string, args: unknown, partyId?: string) =>
+          controller().invokePartyToolAs(ownerWorkspace, member, tool, args, partyId, true),
+        reviewGate: (message: GateReviewMessage, reviewer: GateReviewer) => {
+          // Assigned right after createEngineHost returns, and this closure only
+          // runs once a workspace resolves — but say so out loud rather than
+          // letting a null deref surface as an opaque gate failure.
+          if (!sessionManager) {
+            throw new Error("Message Gate review requested before the engine host finished starting.");
+          }
+          return reviewGateMessage(message, reviewer, {
+            routerBaseUrl: sessionManager.routerBaseUrl(),
+            routerAuthToken: getSettings().routerAuthToken,
+            subscriptionProxy: subscriptionProxyConfig(),
+          });
+        },
+        appearanceGet: () => controller().getAppearance(),
+        appearanceSet: (theme: unknown) => controller().setTheme(theme),
+      },
+      // The distro engine died on its own. Drop it from the registry so the very
+      // next request builds a fresh one; a cached dead client would otherwise
+      // reject every call for the rest of the app's life, and the workspace
+      // would look permanently broken even though respawning fixes it.
+      (error) => {
+        log("warn", "engine", "dropping the dead remote engine so the next request respawns it", {
+          workspace: serialized,
+          error: error.message,
+        });
+        remoteSessionsByWorkspace.delete(workspaceKey(serialized));
+        engineRegistry?.dispose(serialized);
+      });
+      // Stream the distro engine's live session activity to this workspace's windows.
+      client.onEvent((channel, payload) => forwardRemoteEvent(serialized, channel, payload));
+      return client;
+    },
+  });
+  router = host.router;
+  sessionManager = host.sessionManager;
+  workspaceManager = host.workspaceManager;
+  engineRegistry = host.engineRegistry;
+  partyStorageWorkspace = path.join(app.getPath("userData"), "party-store");
+  const partyEngine = host.engineRegistry.forWorkspace(partyStorageWorkspace);
+  await host.startRouter();
+  log("info", "router", "embedded router started", { baseUrl: router.baseUrl, openRouterConfigured: Boolean(settings.openRouterApiKey || process.env.OPENROUTER_API_KEY) });
+
+  windowRegistry = new WindowRegistry();
+  guideScreen = new GuideScreenHost({
+    targetWindow: (windowId) => registry().resolve(windowId)?.window,
+  });
+  guideChat = new GuideChatHost({
+    sessionManager,
+    knowledge: { packaged: app.isPackaged, resourcesPath: process.resourcesPath, appPath: app.getAppPath() },
+    emit: (channel, payload) => guideScreen?.send(channel, payload),
+  });
+
+  // Route session streams to the windows viewing that session's workspace.
+  sessionManager.on("events", (payload: any) => {
+    broadcastToWorkspace(payload.workspace, "session:events", payload);
+  });
+  sessionManager.on("snapshot", (payload: any) => {
+    broadcastToWorkspace(payload.workspace, "session:snapshot", payload);
+  });
+  // Only the workspaces this process serves — a WSL workspace's list comes from
+  // its own engine through forwardRemoteEvent, and `session:list` replaces rather
+  // than merges. See main/sessionListRouting.ts for why that matters.
+  sessionManager.on("sessions", () => {
+    const sessions = sessionManager!.listSessions();
+    const windows = registry().all();
+    for (const entry of windows) {
+      pushSessionList(entry, "local", sessionsForAppWindow(sessions, entry.workspacePath));
+    }
+  });
+  // A member drove a party tool in-process (member-create / send / remove);
+  // global party events are broadcast to every window by broadcastToWorkspace.
+  sessionManager.on("party", (payload: { workspace: string }) => {
+    void appController?.notifyPartyChanged(payload.workspace);
+  });
+  // Codex catalog discovery settled (ready or error): push rebuilt model routes
+  // so pickers update live and a failure is visible (no silent fallback).
+  sessionManager.on("codex-models", () => {
+    void appController?.notifyCodexModelsChanged();
+  });
+  // The model catalog is APP state, not something a window fetches for itself.
+  // Warming it here — rather than leaving the first window's state request to
+  // kick it as a side effect — means discovery no longer races the first render
+  // it is a dependency of, and the listener above is already attached, so the
+  // settle is pushed to whatever windows exist by then.
+  const codexDiscoveryStartedAt = Date.now();
+  void sessionManager.warmCodexModels().then((state) => {
+    log(state.status === "error" ? "warn" : "info", "codex", "account catalog discovery settled", {
+      status: state.status,
+      models: state.models.length,
+      ms: Date.now() - codexDiscoveryStartedAt,
+      ...(state.error ? { error: state.error } : {}),
+    });
+  });
+  // Provider rate-limit usage changed. These limits are ACCOUNT-global (shared by
+  // every workspace/window using that provider), so push to ALL windows.
+  sessionManager.on("usage", (snapshot: unknown) => {
+    for (const entry of registry().all()) {
+      entry.window.webContents.send("usage:update", snapshot);
+    }
+  });
+
+  // The installed build is ONE per machine, so update status — like provider
+  // usage — is account-global and pushed to every window.
+  updateService = new UpdateService({
+    getVersion: () => app.getVersion(),
+    isPackaged: () => app.isPackaged,
+    getChannel: () => getSettings().updateChannel,
+    persistChannel: (channel) => { updateSettings({ updateChannel: channel }); },
+  });
+  updateService.on("status", (status: unknown) => {
+    for (const entry of registry().all()) {
+      entry.window.webContents.send("update:status", status);
+    }
+  });
+
+  sshServerService = new SshServerService({
+    store: new SshServerStore(app.getPath("userData"), safeStorage),
+    transport: new Ssh2Transport(),
+    memberNames: async (server) => {
+      const state = await partyEngine.listAllParties();
+      return state.members
+        .filter((member) => {
+          if (!member.location) return false;
+          const location = parseMemberLocation(member.location);
+          return location.env === "ssh" && location.server === server;
+        })
+        .map((member) => member.name);
+    },
+    renameMemberLocations: async (from, to) => {
+      await partyEngine.renameSshServerLocations(from, to);
+      try {
+        renameSshRecentServer(from, to);
+      } catch (error) {
+        await partyEngine.renameSshServerLocations(to, from);
+        throw error;
+      }
+    },
+    invalidateServer: (server) => engineRegistry?.disposeSshServer(server),
+    recoverMembers: (server) => controller().recoverSshMembers(server),
+  });
+  sshServerService.on("attempt", (attempt) => {
+    for (const entry of registry().all()) entry.window.webContents.send("ssh:attempt", attempt);
+  });
+  sshServerService.on("servers", (servers) => {
+    for (const entry of registry().all()) entry.window.webContents.send("ssh:servers", servers);
+  });
+
+  appController = new AppController({
+    sessionManager,
+    engineRegistry: host.engineRegistry,
+    partyEngine,
+    partyStorageWorkspace,
+    windowRegistry,
+    subscriptionProxy: subscriptionProxyService,
+    getRouterBaseUrl: () => router?.baseUrl || getSettings().routerBaseUrl,
+    getAutomationBaseUrl: () => automationApi?.baseUrl || `http://127.0.0.1:${getSettings().automationApiPort}`,
+    getAppBuild: () => ({ version: app.getVersion(), packaged: app.isPackaged }),
+    openWindow: (workspacePath) => createWindow(workspacePath),
+    appearance: { desktop: true },
+    pickFolder: async (windowId, env, defaultPath) => {
+      const target = registry().resolve(windowId)?.window;
+      const result = await dialog.showOpenDialog(target!, {
+        properties: ["openDirectory"],
+        // A WSL pick is the same dialog opened inside the distro through
+        // the `\\wsl$\` redirector; the caller resolved that path.
+        defaultPath,
+        title: env === "wsl" ? "WSL 폴더 선택" : "실행 위치 폴더 선택",
+      });
+      return result.canceled ? undefined : result.filePaths[0];
+    },
+    onSettingsChanged: () => applyRuntimeSettings(),
+    onPartyGroupsChanged: () => {
+      for (const entry of registry().all()) {
+        entry.window.webContents.send("partyGroups:update", {});
+      }
+    },
+    onWorkspacesChanged: () => reconcileDiscovery(),
+    discord: discordBridge,
+    updater: updateService,
+    approvals,
+    sshServers: sshServerService,
+    pickSshKeyFile: async (windowId) => {
+      const target = registry().resolve(windowId)?.window;
+      const result = await dialog.showOpenDialog(target!, {
+        title: "SSH 개인 키 선택",
+        defaultPath: path.join(os.homedir(), ".ssh"),
+        properties: ["openFile"],
+      });
+      return result.canceled ? undefined : result.filePaths[0];
+    },
+    writeClipboardText: (text) => clipboard.writeText(text),
+    launchCliContinuation: ({ target, location }) => launchCliContinuation({ target, location }),
+    // One line per capability. The previous form repeated the same null check
+    // eight times, which is how `open` came to DROP its `windowId` argument
+    // without TypeScript noticing — a shorter parameter list satisfies a longer
+    // signature, so the knob existed and did nothing.
+    guide: {
+      open: (windowId) => requireGuideScreen().open(windowId),
+      close: () => requireGuideScreen().close(),
+      setSlide: (index) => requireGuideScreen().setSlide(index),
+      get: () => requireGuideScreen().get(),
+      capture: (outputPath) => requireGuideScreen().capture(outputPath),
+      inspect: () => requireGuideScreen().inspect(),
+      setAsk: (open) => requireGuideScreen().setAsk(open),
+      click: (selector) => requireGuideScreen().click(selector),
+      measureStage: (selector) => requireGuideScreen().measureStage(selector),
+    },
+    guideChat: {
+      knowledgePath: () => requireGuideChat().knowledgePath(),
+      settings: () => requireGuideChat().getSettings(),
+      updateSettings: (patch) => requireGuideChat().updateSettings(patch),
+      view: (kind) => requireGuideChat().view(kind),
+      send: (kind, text, viewing) => requireGuideChat().send(kind, text, viewing),
+      reset: (kind) => requireGuideChat().reset(kind),
+      compact: (kind) => requireGuideChat().compact(kind),
+    },
+  });
+  // Remote model catalog: cached copy applies synchronously, then the published
+  // catalog is fetched (and re-fetched periodically). Whenever a different
+  // catalog lands, rebuilt model routes are pushed to every window through the
+  // same path Codex discovery uses — open pickers update live.
+  startRemoteModelCatalog(() => {
+    void appController?.notifyCodexModelsChanged();
+  });
+  automationApi = new AutomationApiServer({
+    port: settings.automationApiPort,
+    controller: appController,
+    windowRegistry,
+  });
+  // Codex members' party MCP server fetches the automation API by URL; give the
+  // SessionManager the ACTUAL bound base URL (lazy — resolved when a member
+  // starts, after the API binds) so a port fallback never leaves it fetching a
+  // dead configured port ("-32603: fetch failed" on send/list).
+  sessionManager.setAutomationBaseUrlProvider(() => automationApi?.baseUrl);
+  // Seed the idle-sleep policy before any engine exists, so the registry replays
+  // it onto each one it builds. A WSL engine reads the distro's settings.json,
+  // never the desktop's, so without this it silently runs on the built-in default.
+  void engineRegistry.setIdleSleep(getSettings().idleSleep);
+  void engineRegistry.setMemberMessaging(getSettings().memberMessaging);
+  registerIpc();
+  registerApplicationMenu();
+  const launched = launchWorkspace();
+  log("info", "window", "initial launch workspace", { argv: process.argv.slice(1), resolvedWorkspace: launched, fellBackToDefault: !launched });
+  await createWindow(launched || defaultWorkspace());
+  await automationApi.start();
+  reconcileDiscovery();
+  // Re-open the Discord gateway for members bridged in an earlier run, so a
+  // restart does not silently stop delivering what the user types there.
+  discordBridge.resume();
+  // Only now — the first check pushes a status, and before a window exists it
+  // would have nowhere to land.
+  updateService.start();
+}
+
+/** Stamp identifying this process run, written into each discovery file. */
+const discoveryStartedAt = new Date().toISOString();
+/** workspaceKey → serialized workspace path this process currently advertises. */
+const advertisedWorkspaces = new Map<string, string>();
+
+/**
+ * Syncs per-workspace discovery files to the CURRENT set of open windows: every
+ * workspace this process hosts gets a `<workspace>/.agent_party_app/instances/
+ * <pid>.json` pointing at the automation API; workspaces no longer hosted are
+ * removed. Idempotent — safe to call after any window create/close/rebind.
+ * Replaces the old machine-global `<userData>/automation.json` (which a second
+ * process, even on a different cwd, overwrote — see docs/FEEDBACK.md).
+ */
+function reconcileDiscovery(): void {
+  const baseUrl = automationApi?.baseUrl;
+  // The API binds an ephemeral port; before it starts, baseUrl reads `:0`. Skip
+  // until it holds the real port — `bootstrap()` calls this again post-start, and
+  // we always (re)write below so an early `:0` is never left stale.
+  if (!baseUrl || baseUrl.endsWith(":0")) {
+    return;
+  }
+  const current = new Map<string, string>();
+  for (const entry of registry().all()) {
+    current.set(workspaceKey(entry.workspacePath), entry.workspacePath);
+  }
+  // Always write the CURRENT baseUrl for every hosted workspace (idempotent).
+  for (const [key, workspace] of current) {
+    writeInstanceDiscovery(workspace, baseUrl, discoveryStartedAt);
+    advertisedWorkspaces.set(key, workspace);
+  }
+  // Drop discovery for workspaces this process no longer hosts.
+  for (const [key, workspace] of [...advertisedWorkspaces]) {
+    if (!current.has(key)) {
+      removeInstanceDiscovery(workspace);
+      advertisedWorkspaces.delete(key);
+    }
+  }
+}
+
+/** Removes every discovery file this process wrote (on quit). */
+function removeAllDiscovery(): void {
+  for (const [key, workspace] of [...advertisedWorkspaces]) {
+    removeInstanceDiscovery(workspace);
+    advertisedWorkspaces.delete(key);
+  }
+}
+
+/**
+ * The one place `session:list` is sent, so its "exactly one producer per window"
+ * rule is auditable at runtime instead of only by reading two call sites.
+ *
+ * `source` is recorded because the failure mode is not a wrong list but a
+ * SECOND one: the channel replaces the renderer's array, so a producer that does
+ * not own the workspace silently overwrites the owner's list. Debug-level — this
+ * fires on every session event, and the answer is only interesting when someone
+ * is asking why a member is flickering.
+ */
+/** One replacement-safe list: source sessions plus every desktop-owned party session. */
+function sessionsForAppWindow(localSessions: SessionView[], workspacePath: string): SessionView[] {
+  const source = sessionsForWindow(localSessions, workspacePath);
+  const global = partyStorageWorkspace ? sessionsForWindow(localSessions, partyStorageWorkspace) : [];
+  const remote = remoteSessionsByWorkspace.get(workspaceKey(workspacePath)) || [];
+  return [...new Map([...source, ...remote, ...global].map((session) => [session.id, session] as const)).values()];
+}
+
+function pushSessionList(entry: { id: string; workspacePath: string; window: BrowserWindow }, source: "local" | "remote", list: unknown): void {
+  log("debug", "window", "session list pushed", {
+    source,
+    window: entry.id,
+    workspace: entry.workspacePath,
+    count: Array.isArray(list) ? list.length : -1,
+  });
+  entry.window.webContents.send("session:list", list);
+}
+
+function broadcastToWorkspace(workspacePath: string, channel: string, payload: unknown): void {
+  const globalPartyEvent = Boolean(partyStorageWorkspace)
+    && workspaceKey(workspacePath) === workspaceKey(partyStorageWorkspace as string);
+  const windows = globalPartyEvent ? registry().all() : registry().forWorkspace(workspacePath);
+  for (const entry of windows) {
+    entry.window.webContents.send(channel, payload);
+  }
+  // Same stream, second reader. The index knows which channel carries approvals,
+  // so this stays one unconditional line rather than a channel test here.
+  approvals.note(workspacePath, channel, payload);
+}
+
+/**
+ * Forwards a remote (WSL) engine's pushed session event to the windows viewing
+ * its workspace, re-stamping the workspace to the Windows-side URI (the distro
+ * sends its own posix path). `session:sessions` maps to the `session:list` IPC.
+ */
+function forwardRemoteEvent(workspacePath: string, channel: string, payload: any): void {
+  if (channel === "session:sessions") {
+    const list: SessionView[] = Array.isArray(payload) ? payload.map((session) => ({ ...session, workspace: workspacePath })) : [];
+    remoteSessionsByWorkspace.set(workspaceKey(workspacePath), list);
+    const combined = sessionsForAppWindow(sessionManager?.listSessions() || [], workspacePath);
+    for (const entry of registry().forWorkspace(workspacePath)) {
+      pushSessionList(entry, "remote", combined);
+    }
+    return;
+  }
+  if (channel === "party:changed") {
+    // Legacy/headless fallback: current hosted party tools normally route back
+    // to the desktop controller and mutate the global store directly.
+    void appController?.notifyPartyChanged(workspacePath);
+    return;
+  }
+  if (channel === "codex-models:changed") {
+    // The remote engine's codex catalog settled: rebuild and push model routes.
+    void appController?.notifyCodexModelsChanged();
+    return;
+  }
+  if (channel === "usage") {
+    // Account-global provider rate limits from a WSL engine. Merge into this
+    // process's aggregate; the "usage" listener above then pushes usage:update to
+    // every window (NOT workspace-stamped — these limits are not per-workspace).
+    sessionManager?.mergeRemoteUsage(payload as UsageLimitsSnapshot);
+    return;
+  }
+  const stamped = payload && typeof payload === "object" ? { ...payload, workspace: workspacePath } : payload;
+  broadcastToWorkspace(workspacePath, channel, stamped);
+}
+
+function focusedWindow(): BrowserWindow | undefined {
+  // The guide is a screen of an ordinary app window now, so there is no longer a
+  // window outside WindowRegistry that menu commands could land on by mistake.
+  return registry().resolve()?.window;
+}
+
+function registerApplicationMenu(): void {
+  const navigate = (view: string) => focusedWindow()?.webContents.send("nav:set", { view });
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    {
+      label: "File",
+      submenu: [
+        { label: "New Window", accelerator: "CmdOrCtrl+Shift+N", click: () => void createWindow(defaultWorkspace()) },
+        { label: "Close Window", role: "close" },
+      ],
+    },
+    {
+      label: "View",
+      submenu: [
+        { label: "Parties", accelerator: "CmdOrCtrl+1", click: () => navigate("workbench") },
+        { label: "Token Usage", accelerator: "CmdOrCtrl+2", click: () => navigate("usage") },
+        { label: "Authentication", accelerator: "CmdOrCtrl+3", click: () => navigate("auth") },
+        { label: "Agent", accelerator: "CmdOrCtrl+4", click: () => navigate("agent") },
+        { label: "Settings", accelerator: "CmdOrCtrl+5", click: () => navigate("settings") },
+        { type: "separator" },
+        { label: "가이드", accelerator: "F1", click: () => void controller().openGuideScreen() },
+        { type: "separator" },
+        { label: "Reload", role: "reload" },
+        { label: "Toggle DevTools", role: "toggleDevTools" },
+      ],
+    },
+    {
+      label: "Session",
+      submenu: [
+        { label: "New Party", accelerator: "CmdOrCtrl+N", click: () => focusedWindow()?.webContents.send("session:new") },
+      ],
+    },
+  ]));
+}
+
+function applyRuntimeSettings(): void {
+  const settings = getSettings();
+  setDebugLoggingEnabled(settings.debugEnabled);
+  router?.updateOptions({
+    authToken: settings.routerAuthToken,
+    openRouterApiKey: settings.openRouterApiKey || process.env.OPENROUTER_API_KEY || "",
+    deepseekApiKey: settings.deepseekApiKey || process.env[DEEPSEEK_API_KEY_ENV] || "",
+  });
+  log("info", "settings", "runtime settings applied", {
+    routerBaseUrl: router?.baseUrl,
+    selectedHarnessId: settings.selectedHarnessId,
+    harnessDefaults: settings.harnessDefaults,
+    openRouterConfigured: Boolean(settings.openRouterApiKey || process.env.OPENROUTER_API_KEY),
+    deepseekConfigured: Boolean(settings.deepseekApiKey || process.env[DEEPSEEK_API_KEY_ENV]),
+    baiConfigured: Boolean(settings.baiApiKey || process.env[BAI_API_KEY_ENV]),
+  });
+}
+
+function senderWorkspace(event: IpcMainInvokeEvent): string {
+  return registry().byWebContents(event.sender)?.workspacePath || defaultWorkspace();
+}
+
+function senderWindowId(event: IpcMainInvokeEvent): string | undefined {
+  return registry().byWebContents(event.sender)?.id;
+}
+
+function registerIpc(): void {
+  // Sync so preload can expose the boot theme before the page's first paint.
+  ipcMain.on("appearance:boot", (event) => {
+    event.returnValue = appearanceBootForWindow();
+  });
+  ipcMain.on("appearance:ready", (event) => {
+    revealByContents.get(event.sender)?.();
+  });
+
+  handle("app:getInitialState", async (event) => controller().getState(senderWorkspace(event), senderWindowId(event)));
+
+  handle("settings:update", async (_event, patch) => controller().updateSettings(patch || {}));
+
+  // Same controller method as POST /api/settings/locale.
+  handle("locale:set", async (_event, locale) => controller().setLocale(locale));
+
+  // Same controller methods as GET/POST /api/appearance/theme.
+  handle("appearance:get", async () => controller().getAppearance());
+  handle("appearance:set", async (_event, theme) => controller().setTheme(theme));
+
+  // Same controller method as `POST /api/party/primer` — the UI and the
+  // automation API must never take different routes to the same setting.
+  handle("party:primer:save", async (_event, patch) => controller().savePartyPrimerSection(patch || {}));
+
+  handle("party:primer:translate", async (_event, patch) => controller().translatePartyPrimerSection(patch || {}));
+
+  handle("workspace:choose", async (event) => {
+    const window = registry().byWebContents(event.sender)?.window;
+    const result = await dialog.showOpenDialog(window!, {
+      properties: ["openDirectory"],
+      title: "Choose AgentParty workspace",
+    });
+    if (result.canceled || !result.filePaths[0]) {
+      return getPublicSettings();
+    }
+    // A `\\wsl$\<distro>\...` selection is interpreted as a WSL workspace.
+    const workspace = serializeWorkspaceLocation(parseWorkspaceLocation(result.filePaths[0]));
+    const state = await controller().setWindowWorkspace(senderWindowId(event), workspace);
+    return state.settings;
+  });
+
+  // 파티 그룹 · 멤버 실행 위치. Thin: every one forwards to the AppController
+  // method its HTTP route also calls, so there is one implementation to keep
+  // right rather than a UI copy and an API copy.
+  handle("partyGroups:list", async () => controller().listPartyGroups());
+  handle("partyGroups:migrate", async (event) => controller().migratePartyGroups([senderWorkspace(event)]));
+  // Explicitly change this window's execution/migration context. Party selection
+  // never calls this: parties live in the Windows-global store.
+  handle("workspace:switch", async (event, workspacePath: string) =>
+    controller().setWindowWorkspace(
+      senderWindowId(event),
+      String(workspacePath || ""),
+      { omitStateWhenUnchanged: true },
+    ));
+  handle("partyGroups:create", async (_event, name: string) => controller().createPartyGroup(String(name || "")));
+  handle("partyGroups:move", async (_event, partyId: string, groupId: string) => controller().movePartyToGroup(String(partyId || ""), String(groupId || "")));
+  handle("partyGroups:rename", async (_event, groupId, name) => controller().renamePartyGroup(String(groupId || ""), String(name || "")));
+  handle("partyGroups:reorder", async (_event, order) => controller().reorderPartyGroups(Array.isArray(order) ? order.map(String) : []));
+  handle("partyGroups:reorderParties", async (_event, groupId, order) => controller().reorderPartiesInGroup(String(groupId || ""), Array.isArray(order) ? order.map(String) : []));
+  handle("partyGroups:remove", async (_event, groupId) => controller().removePartyGroup(String(groupId || "")));
+  handle("cwd:preferences", async (_event, options) => controller().getCwdPreferences(options || {}));
+  handle("cwd:setDefault", async (_event, location) => controller().setDefaultCwd(location));
+  handle("cwd:clearDefault", async (_event, env) => controller().clearDefaultCwd(env === "wsl" ? "wsl" : "windows"));
+  handle("cwd:removeRecent", async (_event, location) => controller().removeRecentCwd(location));
+  handle("cwd:check", async (_event, location) => controller().checkCwd(location));
+  handle("cwd:distros", async () => controller().listWslDistros());
+  handle("cwd:browse", async (event, env, distro) => controller().browseCwd(env === "wsl" ? "wsl" : "windows", senderWindowId(event), distro ? String(distro) : undefined));
+  handle("cwd:memberLocations", async (event) => controller().memberLocations(senderWorkspace(event)));
+  handle("ssh:list", async () => controller().listSshServers());
+  handle("ssh:connectDraft", async (_event, draft) => controller().sshConnectDraft(draft), { redactArgs: [0] });
+  handle("ssh:trustFingerprint", async (_event, attemptId) => controller().sshTrustFingerprint(String(attemptId || "")));
+  handle("ssh:cancelAttempt", async (_event, attemptId) => controller().sshCancelAttempt(String(attemptId || "")));
+  handle("ssh:setupAutoLogin", async (_event, attemptId) => controller().sshSetupAutoLogin(String(attemptId || "")));
+  handle("ssh:continueWithPassword", async (_event, attemptId) => controller().sshContinueWithPassword(String(attemptId || "")));
+  handle("ssh:savePasswordLogin", async (_event, attemptId) => controller().sshSavePasswordLogin(String(attemptId || "")));
+  handle("ssh:retest", async (_event, attemptId) => controller().sshRetest(String(attemptId || "")));
+  handle("ssh:pickKeyFile", async (event) => controller().sshPickKeyFile(senderWindowId(event)));
+  handle("ssh:inspectKeyFile", async (_event, file) => controller().sshInspectKeyFile(String(file || "")));
+  handle("ssh:testServer", async (_event, name) => controller().sshTestServer(String(name || "")));
+  handle("ssh:reconnect", async (_event, name) => controller().sshReconnect(String(name || "")));
+  handle("ssh:trustNewFingerprint", async (_event, name) => controller().sshTrustNewFingerprint(String(name || "")));
+  handle("ssh:deleteServer", async (_event, name, options) => controller().sshDeleteServer(String(name || ""), { removeAutoLoginKey: options?.removeAutoLoginKey === true }));
+  handle("ssh:copyPublicKey", async () => controller().sshCopyPublicKey());
+  handle("ssh:checkRemotePath", async (_event, server, cwd) => controller().sshCheckRemotePath(String(server || ""), String(cwd || "")));
+  handle("ssh:remoteHome", async (_event, server) => controller().sshRemoteHome(String(server || "")));
+  handle("ssh:listRemoteDirectories", async (_event, server, remotePath) => controller().sshListRemoteDirectories(String(server || ""), String(remotePath || "")));
+  handle("ssh:suggestRemotePaths", async (_event, server, input) => controller().sshSuggestRemotePaths(String(server || ""), String(input || "")));
+
+  handle("auth:list", async (event) => controller().listAuthProviders(senderWorkspace(event)));
+  handle("auth:setDeepseekKey", async (event, value: string) => controller().setDeepseekKey(value || "", senderWorkspace(event)));
+  handle("auth:clearDeepseekKey", async (event) => controller().clearDeepseekKey(senderWorkspace(event)));
+  handle("auth:testDeepseekKey", async (event) => controller().testDeepseekKey(senderWorkspace(event)));
+  handle("auth:setBaiKey", async (event, value: string) => controller().setBaiKey(value || "", senderWorkspace(event)));
+  handle("auth:clearBaiKey", async (event) => controller().clearBaiKey(senderWorkspace(event)));
+  handle("auth:testBaiKey", async (event) => controller().testBaiKey(senderWorkspace(event)));
+  handle("auth:setOpenRouterKey", async (event, value: string) => controller().setOpenRouterKey(value || "", senderWorkspace(event)));
+  handle("auth:clearOpenRouterKey", async (event) => controller().clearOpenRouterKey(senderWorkspace(event)));
+  handle("auth:testOpenRouterKey", async (event) => controller().testOpenRouterKey(senderWorkspace(event)));
+  handle("auth:testNativeCli", async (event, provider: string, host: string) => {
+    if (provider !== "codex" && provider !== "claude" && provider !== "cursor" && provider !== "grok") {
+      throw new Error(`Unsupported native CLI provider '${provider}'.`);
+    }
+    if (host !== "windows" && host !== "wsl") {
+      throw new Error(`Unsupported native CLI host '${host}'.`);
+    }
+    return controller().testNativeCliAuth(provider, host, senderWorkspace(event));
+  });
+  handle("auth:loginSubscription", async (event, provider: string) => {
+    if (provider !== "codex" && provider !== "claude") {
+      throw new Error(`Unsupported subscription provider '${provider}'.`);
+    }
+    return controller().loginSubscriptionProvider(provider, senderWorkspace(event));
+  });
+  handle("auth:disconnectSubscription", async (event, provider: string) => {
+    if (provider !== "codex" && provider !== "claude" && provider !== "cursor") {
+      throw new Error(`Unsupported subscription provider '${provider}'.`);
+    }
+    return controller().disconnectSubscriptionProvider(provider, senderWorkspace(event));
+  });
+
+  handle("models:list", async (event) => controller().listModels(senderWorkspace(event)));
+  handle("models:refreshCodex", async (event) => controller().refreshCodexModels(senderWorkspace(event)));
+
+  handle("discord:get", async () => controller().discordStatus());
+  handle("discord:update", async (_event, patch) => controller().updateDiscordSettings(patch as any));
+  handle("usage:get", async () => controller().getUsageLimits());
+  handle("usage:refresh", async () => controller().refreshUsageLimits());
+  // App self-update — the same controller methods as GET /api/update and
+  // POST /api/update/{check,download,install}.
+  handle("update:get", async () => controller().getUpdateStatus());
+  handle("update:channel:get", async () => controller().getUpdateChannel());
+  handle("update:channel:set", async (_event, channel: unknown) => controller().setUpdateChannel(channel));
+  handle("update:versions", async (_event, options: { refresh?: boolean } = {}) => controller().listReleaseVersions(options || {}));
+  handle("update:check", async (_event, options?: { quiet?: boolean }) => controller().checkForUpdate(options || {}));
+  handle("update:download", async () => controller().downloadUpdate());
+  handle("update:install", async () => controller().installUpdate());
+  handle("tokenUsage:get", async (event, query: unknown) => controller().getTokenUsage(senderWorkspace(event), query as any));
+  handle("tokenUsage:turns", async (event, query: unknown) => controller().getTokenUsageTurns(senderWorkspace(event), query as any));
+
+  handle("session:create", async (event, input?: unknown) => controller().createSession(senderWorkspace(event), input as any));
+  handle("session:listResumable", async (event, workspacePath?: string) => controller().listResumableSessions(workspacePath || senderWorkspace(event)));
+  handle("session:resume", async (event, sessionId: string, workspacePath?: string) => controller().resumeSession(workspacePath || senderWorkspace(event), sessionId));
+  handle("session:close", async (event, sessionId: string) => controller().closeSession(senderWorkspace(event), sessionId));
+  // Answers an approval by its own id, no session needed — the same controller
+  // method a phone reaches through `approval.respond`.
+  handle("approval:respond", async (_event, requestId: string, behavior: "allow" | "deny", updatedInput?: unknown, message?: string) =>
+    controller().respondToApproval(String(requestId || ""), behavior === "deny" ? "deny" : "allow", updatedInput, message));
+  handle("session:send", async (event, sessionId: string, text: string, attachments?: unknown) => controller().sendSessionMessage(senderWorkspace(event), sessionId, text, sanitizeAttachments(attachments)));
+  handle("session:interrupt", async (event, sessionId: string) => controller().interruptSession(senderWorkspace(event), sessionId));
+  handle("session:forceStop", async (event, sessionId: string) => controller().forceStopSession(senderWorkspace(event), sessionId));
+  handle("session:restart", async (event, sessionId: string) => controller().restartSession(senderWorkspace(event), sessionId));
+  handle("session:compact", async (event, sessionId: string) => controller().compactSession(senderWorkspace(event), sessionId));
+  handle("session:setModel", async (event, sessionId: string, model: string, providerId?: string, runtimeModel?: string) => {
+    await controller().setSessionModel(senderWorkspace(event), sessionId, model, providerId, runtimeModel);
+  });
+  handle("session:setEffort", async (event, sessionId: string, effort: string) => controller().setSessionEffort(senderWorkspace(event), sessionId, effort));
+  handle("session:setThinking", async (event, sessionId: string, mode: string, budget?: number) => controller().setSessionThinking(senderWorkspace(event), sessionId, mode, budget));
+  handle("session:setPermissionMode", async (event, sessionId: string, permissionMode: string) => controller().setSessionPermissionMode(senderWorkspace(event), sessionId, permissionMode));
+  handle("session:setCodexPolicy", async (event, sessionId: string, policy: any) => controller().setSessionCodexPolicy(senderWorkspace(event), sessionId, policy));
+  handle("session:setCursorPolicy", async (event, sessionId: string, policy: any) => controller().setSessionCursorPolicy(senderWorkspace(event), sessionId, policy));
+  handle("session:approve", async (event, sessionId: string, requestId: string, behavior: "allow" | "deny", updatedInput?: unknown, message?: string) => {
+    await controller().approveSession(senderWorkspace(event), sessionId, requestId, behavior, updatedInput, message);
+  });
+  handle("session:mcpList", async (event, sessionId: string) => controller().listSessionMcpServers(senderWorkspace(event), sessionId));
+  handle("session:mcpReconnect", async (event, sessionId: string, server: string) => controller().sessionMcpAction(senderWorkspace(event), sessionId, "reconnect", { server }));
+  handle("session:mcpToggle", async (event, sessionId: string, server: string, enabled: boolean) => controller().sessionMcpAction(senderWorkspace(event), sessionId, "toggle", { server, enabled }));
+  handle("session:mcpAuthenticate", async (event, sessionId: string, server: string) => controller().sessionMcpAction(senderWorkspace(event), sessionId, "authenticate", { server }));
+  // Diagnostics — the same controller methods as GET /api/diagnostics and
+  // POST /api/diagnostics/open-logs.
+  handle("diagnostics:get", async (event) => controller().getDiagnostics(senderWorkspace(event)));
+  handle("diagnostics:openLogFolder", async () => controller().openLogFolder());
+  // Environment readiness — the same controller methods as GET /api/environment
+  // and POST /api/environment/repair.
+  handle("environment:get", async (event, options: { refresh?: boolean; includeWsl?: boolean } = {}) => controller().getEnvironment(senderWorkspace(event), options));
+  handle("environment:repair", async (event, repairId: string) => controller().repairEnvironment(senderWorkspace(event), String(repairId || "")));
+  handle("shell:openExternal", async (_event, target: string) => {
+    if (/^https?:\/\//i.test(String(target || ""))) {
+      await shell.openExternal(String(target));
+      return { ok: true };
+    }
+    return { ok: false, error: "Only http(s) URLs can be opened." };
+  });
+  // A clicked file link. Same AppController method as POST /api/shell/open-path.
+  handle("shell:openPath", async (event, target: string, options?: { reveal?: boolean; sourceLocation?: string }) =>
+    controller().openLocalPath(senderWindowId(event), String(target || ""), {
+      reveal: options?.reveal === true,
+      sourceLocation: options?.sourceLocation,
+    }));
+  // Same AppController method as POST /api/clipboard/image — one route for the
+  // thumbnail's copy button and for an agent driving it.
+  handle("clipboard:writeImage", async (_event, image: unknown) => controller().writeImageToClipboard((image || {}) as { dataBase64?: string; mediaType?: string }));
+
+  handle("window:minimize", async (event) => controller().minimizeWindow(senderWindowId(event)));
+  handle("window:maximize", async (event) => controller().toggleMaximizeWindow(senderWindowId(event)));
+  handle("window:close", async (event) => controller().closeWindow(senderWindowId(event)));
+  handle("window:new", async (event, workspacePath?: string, partyId?: string) =>
+    controller().openWindow(workspacePath || senderWorkspace(event), partyId)
+  );
+  handle("window:list", async () => controller().listWindows());
+  handle("guide:open", async () => controller().openGuideScreen());
+  handle("guide:offer", async () => controller().getGuideOffer());
+  handle("guide:offer:shown", async () => controller().markGuideOfferShown());
+  handle("guide:knowledge", async () => controller().guideKnowledge());
+  handle("guide:models", async () => controller().guideModels());
+  handle("guide:chat:get", async (_event, kind: unknown) => controller().getGuideChat(requireChatKind(kind)));
+  handle("guide:chat:send", async (_event, kind: unknown, text: string, viewing?: { index: number; title: string; scene: string }) =>
+    controller().sendGuideChat(requireChatKind(kind), text, viewing));
+  handle("guide:chat:reset", async (_event, kind: unknown) => controller().resetGuideChat(requireChatKind(kind)));
+  handle("guide:chat:compact", async (_event, kind: unknown) => controller().compactGuideChat(requireChatKind(kind)));
+  handle("guide:chat:settings", async (_event, patch?: unknown) => {
+    if (patch && typeof patch === "object") {
+      return controller().updateGuideChatSettings(patch);
+    }
+    return controller().getGuideChatSettings();
+  });
+
+  // Party ops carry the SENDER WINDOW id: each window has its own active party, so
+  // the same workspace's two windows view/act on different parties independently.
+  handle("party:list", async (event) => controller().listPartyMembers(senderWorkspace(event), senderWindowId(event)));
+  handle("party:createParty", async (event, input) => controller().createParty(senderWorkspace(event), input, senderWindowId(event)));
+  handle("party:select", async (event, partyId: string) => controller().selectParty(senderWorkspace(event), partyId, senderWindowId(event)));
+  handle("party:deleteParty", async (event, partyId: string) => controller().removeParty(senderWorkspace(event), partyId, senderWindowId(event)));
+  handle("party:create", async (event, input) => controller().createPartyMember(senderWorkspace(event), input, senderWindowId(event)));
+  handle("party:send", async (event, to: string, content: string, from?: string, attachments?: unknown) => controller().sendPartyMessage(senderWorkspace(event), to, content, from, sanitizeAttachments(attachments), senderWindowId(event)));
+  handle("party:message", async (event, name: string, text: string, attachments?: unknown, options?: { interrupt?: boolean }) => controller().sendMemberMessage(senderWorkspace(event), name, text, sanitizeAttachments(attachments), senderWindowId(event), { interrupt: options?.interrupt === true }));
+  handle("party:queue:get", async (event, name: string) => controller().getMemberQueue(senderWorkspace(event), name, senderWindowId(event)));
+  // Untrusted-shape validation runs here too, not only on the HTTP edge, so a
+  // malformed command from either caller is refused instead of guessed at.
+  handle("party:queue:command", async (event, name: string, command: unknown) => controller().runQueueCommand(senderWorkspace(event), name, parseQueueCommand(command), senderWindowId(event)));
+  handle("party:close", async (event, name: string) => controller().closePartyMember(senderWorkspace(event), name, senderWindowId(event)));
+  handle("party:resume", async (event, name: string) => controller().resumePartyMember(senderWorkspace(event), name, senderWindowId(event)));
+  handle("party:respawn", async (event, name: string, input?: StartPartyMemberInput) => controller().respawnPartyMember(senderWorkspace(event), name, optionalArg(input), senderWindowId(event)));
+  handle("party:open", async (event, name: string) => controller().openPartyMember(senderWorkspace(event), name, senderWindowId(event)));
+  handle("party:start", async (event, name: string, input?: unknown) => controller().startPartyMember(senderWorkspace(event), name, optionalArg(input) as any, senderWindowId(event)));
+  handle("party:bind", async (event, name: string, sessionId: string) => controller().bindPartyMember(senderWorkspace(event), name, sessionId, senderWindowId(event)));
+  handle("party:remove", async (event, name: string) => controller().removePartyMember(senderWorkspace(event), name, senderWindowId(event)));
+  handle("party:autoCompact", async (event, name: string, autoCompact: unknown) => controller().setMemberAutoCompact(senderWorkspace(event), name, autoCompact, senderWindowId(event)));
+  // Idle sleep, driven by hand from the sidebar menu. These reach the same three
+  // party actions the idle sweep and the HTTP API use — one implementation.
+  handle("party:keepAwake", async (event, name: string, keepAwake: boolean) => controller().setMemberKeepAwake(senderWorkspace(event), name, keepAwake === true, senderWindowId(event)));
+  handle("party:sleep", async (event, name: string) => controller().sleepPartyMember(senderWorkspace(event), name, senderWindowId(event)));
+  handle("party:wake", async (event, name: string) => controller().wakePartyMember(senderWorkspace(event), name, senderWindowId(event)));
+  handle("party:compact", async (event, name: string) => controller().compactPartyMember(senderWorkspace(event), name, senderWindowId(event)));
+  // Member-scoped permission: persists AND applies to the live adapter, so a
+  // change made while the member's session is down is not dropped.
+  handle("party:permission", async (event, name: string, permission: MemberPermissionInput) => controller().setMemberPermission(senderWorkspace(event), name, permission || {}, senderWindowId(event)));
+  handle("party:runtime", async (event, name: string, runtime: MemberRuntimeInput) => controller().setMemberRuntime(senderWorkspace(event), name, runtime || {}, senderWindowId(event)));
+  handle("party:gate", async (event, name: string, gate: unknown) => controller().setMemberGate(senderWorkspace(event), name, gate, senderWindowId(event)));
+  handle("party:outbound-interrupt", async (event, name: string, outboundInterrupt: boolean | null) => controller().setMemberOutboundInterrupt(senderWorkspace(event), name, outboundInterrupt, senderWindowId(event)));
+  handle("party:partyGate", async (event, partyId: string, gate: unknown) => controller().setPartyGate(senderWorkspace(event), partyId, gate, senderWindowId(event)));
+  // Tab layout is PARTY state, not window state: one writer, broadcast to the
+  // other windows on that party (see AppController.setPartyLayout).
+  handle("party:layout:get", async (event) => controller().getPartyLayout(senderWorkspace(event), senderWindowId(event)));
+  handle("party:layout:set", async (event, layout: unknown) => controller().setPartyLayout(senderWorkspace(event), layout, senderWindowId(event)));
+  handle("party:transcript:get", async (event, name: string, partyId?: string) => (
+    controller().getMemberTranscript(senderWorkspace(event), name, senderWindowId(event), partyId)
+  ));
+  handle("party:transcript:save", async (event, name: string, save: TranscriptSave) => controller().saveMemberTranscript(senderWorkspace(event), name, save, senderWindowId(event)));
+  handle("party:transcript:image", async (event, file: string) => controller().getTranscriptImage(senderWorkspace(event), file));
+  handle("party:harness-original", async (event, name: string) => controller().getHarnessOriginal(senderWorkspace(event), name, senderWindowId(event)));
+  handle("party:cli-continuation", async (event, name: string, action: "inspect" | "launch") =>
+    controller().continueMemberInCli(senderWorkspace(event), name, action, senderWindowId(event)));
+}
+
+/**
+ * Restores `undefined` for an omitted optional argument.
+ *
+ * Electron serializes an omitted/`undefined` invoke argument as `null`, so a
+ * handler's `input?: T` arrives as `null` and any downstream TypeScript default
+ * (`input: T = {}`) never fires — the callee then dereferences null. That is
+ * exactly how `respawnPartyMember(name)` crashed with "Cannot read properties of
+ * null (reading 'selectedHarnessId')". Normalize at the boundary that introduces
+ * the null, so every optional-object handler is safe rather than each callee
+ * having to re-guard.
+ */
+function optionalArg<T>(value: T | null | undefined): T | undefined {
+  return value === null ? undefined : value;
+}
+
+function handle(
+  channel: string,
+  listener: (event: IpcMainInvokeEvent, ...args: any[]) => Promise<unknown> | unknown,
+  options: { redactArgs?: readonly number[] } = {},
+): void {
+  ipcMain.handle(channel, async (event, ...args) => {
+    log("info", "ipc", channel, { args: summarizeIpcArgs(args, options.redactArgs) });
+    try {
+      return await listener(event, ...args);
+    } catch (error) {
+      log("error", "ipc", `${channel} failed`, { error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  });
+}
+
+/**
+ * Produces a compact, bounded description of IPC arguments for logging.
+ *
+ * The generic {@link handle} wrapper used to log the raw `args`, so channels
+ * that carry bulk payloads — above all `party:transcript:save`, whose second
+ * arg is the member's entire transcript array — dumped tens to hundreds of MB
+ * per call into the synchronous log file (see the 2026-07-09 handoff). This
+ * describes shape and size WITHOUT deep-serializing large payloads: an array of
+ * 100k transcript blocks becomes `"[array 100000 items]"`, never 150 MB of JSON.
+ * Diagnostic value (which channel, arg shapes, sizes) is preserved; the raw
+ * request/response content lives in the per-session RawLogger, not here.
+ */
+function summarizeIpcArgs(args: unknown[], redactArgs: readonly number[] = []): unknown[] {
+  const redacted = new Set(redactArgs);
+  return args.map((arg, index) => redacted.has(index) ? "[redacted]" : describeForLog(arg, 0));
+}
+
+const LOG_MAX_STRING = 200;
+const LOG_MAX_ARRAY = 20;
+const LOG_MAX_KEYS = 30;
+const LOG_MAX_DEPTH = 2;
+
+function describeForLog(value: unknown, depth: number): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value.length > LOG_MAX_STRING ? `[string ${value.length} chars]` : value;
+  }
+  if (typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.length > LOG_MAX_ARRAY
+      ? `[array ${value.length} items]`
+      : value.map((item) => describeForLog(item, depth + 1));
+  }
+  if (depth >= LOG_MAX_DEPTH) {
+    return "[object]";
+  }
+  const output: Record<string, unknown> = {};
+  let count = 0;
+  for (const [key, item] of Object.entries(value)) {
+    if (count >= LOG_MAX_KEYS) {
+      output["…"] = "[more]";
+      break;
+    }
+    count += 1;
+    output[key] = describeForLog(item, depth + 1);
+  }
+  return output;
+}
+
+function controller(): AppController {
+  if (!appController) {
+    throw new Error("App controller is not initialized.");
+  }
+  return appController;
+}
+
+function registry(): WindowRegistry {
+  if (!windowRegistry) {
+    throw new Error("Window registry is not initialized.");
+  }
+  return windowRegistry;
+}
+
+/** Preferred router port from a configured baseUrl; 0 (ephemeral) when unset. */
+function parsePort(baseUrl: string): number {
+  try {
+    return Number(new URL(baseUrl).port || 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * One AgentParty process per machine — a second launch becomes a WINDOW here.
+ *
+ * Party data now has one Windows-global store, and a session id only means
+ * anything inside the process that created it. Two desktop processes could not
+ * see each other's sessions and each started its own harness for the same
+ * member, overwrote the shared binding, and abandoned the other's process.
+ * Measured on a live install: one member holding EIGHT `claude` processes on
+ * the same conversation, ~2.5 GB, still growing.
+ *
+ * Multiplexing was never the problem — the app is already built for it.
+ * `EngineRegistry.forWorkspace` still keys execution contexts by workspace,
+ * while party/group/member state has one Windows-global engine. WindowRegistry
+ * tracks the execution/migration context each window is viewing. One process can
+ * therefore host Windows and WSL execution locations while every window sees the
+ * same parties. (`main.ts` once documented this handler before it existed.)
+ *
+ * `AGENTPARTY_ALLOW_MULTI_INSTANCE=1` keeps the old behaviour for QA: the e2e
+ * scripts drive several isolated apps at once and pass it already.
+ */
+const allowMultiInstance = process.env.AGENTPARTY_ALLOW_MULTI_INSTANCE === "1";
+if (!allowMultiInstance && !app.requestSingleInstanceLock()) {
+  // Another instance owns the lock; it will open our workspace as a window.
+  app.quit();
+} else {
+  if (!allowMultiInstance) {
+    app.on("second-instance", (_event, argv) => {
+      const requested = workspaceFromArgv(argv);
+      log("info", "window", "second instance folded into this process", { argv: argv.slice(1), resolvedWorkspace: requested });
+      // The lock is taken before `whenReady`, so a launch that races our own
+      // startup can land here while `bootstrap` is still running — and
+      // `registry()` throws until it finishes. Dropping the event is right: the
+      // window bootstrap is about to open serves that user just as well.
+      if (!windowRegistry) {
+        log("info", "window", "second instance arrived during startup; the launching window covers it");
+        return;
+      }
+      // A relaunch with no workspace is "show me the app", not "open a second
+      // window of the same thing" — surface what is already open instead.
+      const existing = registry().all();
+      if (!requested && existing.length > 0) {
+        const target = existing[0].window;
+        if (target.isMinimized()) {
+          target.restore();
+        }
+        target.focus();
+        return;
+      }
+      void createWindow(requested || defaultWorkspace()).catch((error) => {
+        log("error", "window", "could not open a window for the second instance", { error: error instanceof Error ? error.message : String(error) });
+      });
+    });
+  }
+
+  app.whenReady().then(bootstrap).catch((error) => {
+    dialog.showErrorBox("AgentParty failed to start", error instanceof Error ? error.message : String(error));
+    app.quit();
+  });
+}
+
+app.on("activate", () => {
+  if (registry().all().length === 0) {
+    void createWindow(defaultWorkspace());
+  }
+});
+
+app.on("before-quit", () => {
+  log("info", "app", "before quit");
+  appController?.dispose();
+  removeAllDiscovery();
+  engineRegistry?.disposeAll();
+  sshServerService?.dispose();
+  sessionManager?.dispose();
+  router?.dispose();
+  automationApi?.dispose();
+  subscriptionProxyService?.dispose();
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
+    app.quit();
+  }
+});

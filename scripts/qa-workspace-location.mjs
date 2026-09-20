@@ -1,0 +1,113 @@
+/*
+ * WorkspaceLocation codec unit test (Stage 1 of the WSL remote effort, see
+ * the WSL remote-engine design). Pure functions, so verify directly. The key guarantee:
+ * local locations are byte-identical to the previous `path.resolve(path)` logic,
+ * so adopting the codec changes nothing for local workspaces.
+ */
+import { build } from "esbuild";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
+import { qaTempDir } from "./lib/qaTemp.mjs";
+
+const root = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(root, "..");
+
+const result = await build({
+  entryPoints: [path.join(projectRoot, "src/shared/workspaceLocation.ts")],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  write: false,
+});
+
+const outDir = qaTempDir();
+const bundlePath = path.join(outDir, "workspaceLocation.mjs");
+writeFileSync(bundlePath, result.outputFiles[0].text);
+const W = await import(pathToFileURL(bundlePath).href);
+
+const failures = [];
+const assert = (cond, msg) => { console.log(`  ${cond ? "✓" : "✗"} ${msg}`); if (!cond) failures.push(msg); };
+
+console.log("WorkspaceLocation codec assertions:");
+
+// --- local: backward compatible, byte-identical identity ------------------
+const winPath = "C:\\Project\\AgentPartyApp";
+const local = W.parseWorkspaceLocation(winPath);
+assert(local.host.kind === "local", "a Windows path parses as local");
+assert(local.path === winPath, "local keeps the raw path");
+assert(W.serializeWorkspaceLocation(local) === winPath, "local serializes back to the raw path (no URI)");
+const nativeKey = (value) => process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
+assert(W.workspaceKey(winPath) === nativeKey(winPath), "local key follows the native filesystem's case identity");
+
+// a relative-ish local path still resolves like before
+assert(W.workspaceKey("C:\\a\\b\\..\\c") === nativeKey("C:\\a\\b\\..\\c"), "local key normalizes via the platform path.resolve");
+if (process.platform === "win32") {
+  assert(W.workspaceKey("C:\\Project\\AgentPartyApp") === W.workspaceKey("c:\\project\\agentpartyapp"), "Windows casing cannot split one workspace into two engines");
+}
+
+// --- wsl: URI round-trips and gets a stable, non-Windows identity ---------
+const uri = "wsl+Ubuntu:/home/user/project";
+const wsl = W.parseWorkspaceLocation(uri);
+assert(wsl.host.kind === "wsl" && wsl.host.distro === "Ubuntu", "wsl URI parses distro");
+assert(wsl.path === "/home/user/project", "wsl URI parses the posix path");
+assert(W.serializeWorkspaceLocation(wsl) === uri, "wsl serializes back to the same URI");
+assert(W.workspaceKey(uri) === "wsl+ubuntu:/home/user/project", "wsl key is the normalized URI, not a Windows path");
+assert(!W.workspaceKey(uri).includes("C:\\"), "wsl key is never mangled into a Windows path");
+
+// distro with a dash; posix normalization in the key
+const uri2 = "wsl+Ubuntu-22.04:/home/user/./a/../proj";
+assert(W.workspaceKey(uri2) === "wsl+ubuntu-22.04:/home/user/proj", "wsl key posix-normalizes the path");
+assert(W.workspaceKey("wsl+Ubuntu-22.04:/home/user/proj") === W.workspaceKey("wsl+ubuntu-22.04:/home/user/proj"), "WSL distro casing cannot split one workspace into two engines");
+
+// --- UNC: a \\wsl$\ / \\wsl.localhost\ folder pick becomes a WSL location ---
+const unc1 = W.parseWorkspaceLocation("\\\\wsl$\\Ubuntu-22.04\\home\\dev\\project");
+assert(unc1.host.kind === "wsl" && unc1.host.distro === "Ubuntu-22.04", "\\\\wsl$ UNC parses distro");
+assert(unc1.path === "/home/dev/project", "\\\\wsl$ UNC parses the posix path");
+assert(W.serializeWorkspaceLocation(unc1) === "wsl+Ubuntu-22.04:/home/dev/project", "\\\\wsl$ UNC serializes to the wsl URI");
+const unc2 = W.parseWorkspaceLocation("\\\\wsl.localhost\\Debian\\srv\\app");
+assert(unc2.host.kind === "wsl" && unc2.host.distro === "Debian" && unc2.path === "/srv/app", "\\\\wsl.localhost UNC parses to wsl location");
+const uncUpper = W.parseWorkspaceLocation("\\\\WSL$\\Ubuntu-22.04\\home\\dev\\project");
+assert(uncUpper.host.kind === "wsl" && uncUpper.path === "/home/dev/project", "WSL UNC host spelling is case-insensitive like Windows");
+
+// --- isolation: local and wsl with the same tail are different identities -
+assert(W.workspaceKey("/home/user/project") !== W.workspaceKey("wsl+Ubuntu:/home/user/project"), "local vs wsl with same path are distinct identities");
+assert(W.workspaceKey("wsl+Ubuntu:/p") !== W.workspaceKey("wsl+Debian:/p"), "same path on different distros are distinct identities");
+
+// --- equality helper ------------------------------------------------------
+assert(W.workspaceLocationsEqual(W.parseWorkspaceLocation(uri), W.parseWorkspaceLocation(uri)), "equal locations compare equal");
+assert(!W.workspaceLocationsEqual(W.parseWorkspaceLocation(uri), local), "different hosts compare unequal");
+
+// --- workspaceArgFromArgv: never fabricate a workspace from a broken argv ---
+console.log("\n--workspace argv resolution:");
+const argv = (...rest) => [".", ...rest];
+// happy paths
+assert(W.workspaceArgFromArgv(argv("--workspace", "C:\\Project\\custom jira")).location === "C:\\Project\\custom jira", "`--workspace <abs>` resolves the path (spaces ok)");
+assert(W.workspaceArgFromArgv(argv("--workspace=C:\\Project\\x")).location === "C:\\Project\\x", "`--workspace=<abs>` resolves the path");
+assert(W.workspaceArgFromArgv(argv("--workspace", "wsl+Ubuntu:/home/dev/p")).location === "wsl+Ubuntu:/home/dev/p", "a wsl+ URI is accepted");
+const relativeWsl = W.workspaceArgFromArgv(argv("--workspace", "wsl+Ubuntu:home/dev/p"));
+assert(relativeWsl.location === undefined && /absolute path required/i.test(relativeWsl.warning || ""), "a relative WSL workspace is rejected instead of depending on engine cwd");
+// THE reported bug (reproduced from a live log): Electron's appendSwitch injects
+// Chromium flags between `--workspace` and its value and moves the real path to
+// the end. Recover it from the trailing positional — never consume a flag.
+const reordered = W.workspaceArgFromArgv(["AgentParty.exe", "--workspace", "--allow-file-access-from-files", "--disable-features=CalculateNativeWinOcclusion", "--disable-renderer-backgrounding", "C:\\Project\\custom jira"]);
+assert(reordered.location === "C:\\Project\\custom jira" && !reordered.warning, "recovers the reordered `--workspace` path from the trailing positional (real Electron argv)");
+assert(!W.workspaceArgFromArgv(["AgentParty.exe", "--workspace", "--allow-file-access-from-files"]).location, "the exe (argv[0]) is never mistaken for the path when the real path is absent");
+// path truly dropped (no positional at all): warn + fall back, never fabricate
+const dropped = W.workspaceArgFromArgv(argv("--workspace", "--allow-file-access-from-files"));
+assert(dropped.location === undefined, "a flag after `--workspace` with no positional is NOT consumed as the path (no fabricated workspace)");
+assert(typeof dropped.warning === "string" && /dropped|reorder/i.test(dropped.warning), "a dropped `--workspace` path is surfaced as a warning, not silent");
+// a non-absolute local value would otherwise cwd-resolve into a bogus path
+const rel = W.workspaceArgFromArgv(argv("--workspace", "custom jira"));
+assert(rel.location === undefined && /non-absolute/i.test(rel.warning || ""), "a non-absolute local `--workspace` value is rejected with a warning (not cwd-resolved)");
+// no --workspace at all → nothing, no warning
+const none = W.workspaceArgFromArgv(argv("--other", "x"));
+assert(none.location === undefined && !none.warning, "no `--workspace` → no location and no spurious warning");
+
+console.log("");
+if (failures.length) {
+  console.log(`WORKSPACE LOCATION FAILED: ${failures.length} assertion(s)`);
+  process.exit(1);
+}
+console.log("WORKSPACE LOCATION PASSED");
+process.exit(0);

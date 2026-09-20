@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentparty.dev/schemas/theme.schema.json",
+  "title": "AgentParty Theme",
+  "description": "Declarative contract for one AgentParty color theme.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "label", "scheme", "color", "shape"],
+  "properties": {
+    "$schema": { "type": "string", "pattern": ".*\\S.*" },
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" },
+    "label": { "type": "string", "pattern": ".*\\S.*" },
+    "scheme": { "enum": ["light", "dark"] },
+    "color": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bg-0", "bg-1", "bg-2", "bg-3", "bg-4", "bg-input", "border-subtle", "border", "border-strong", "text-0", "text-1", "text-2", "text-3", "accent", "accent-dim", "accent-bd", "accent-fg", "selection", "selection-fg", "status", "status-fg", "live", "live-dim", "live-bd", "compact-zone", "success", "success-dim", "success-bd", "danger", "danger-dim", "danger-bd", "danger-fg", "warning", "warning-dim", "warning-bd", "warning-fg", "grid", "scrim", "shadow", "shadow-strong"],
+      "properties": {
+        "bg-0": { "$ref": "#/$defs/colorValue" }, "bg-1": { "$ref": "#/$defs/colorValue" }, "bg-2": { "$ref": "#/$defs/colorValue" }, "bg-3": { "$ref": "#/$defs/colorValue" }, "bg-4": { "$ref": "#/$defs/colorValue" }, "bg-input": { "$ref": "#/$defs/colorValue" },
+        "border-subtle": { "$ref": "#/$defs/colorValue" }, "border": { "$ref": "#/$defs/colorValue" }, "border-strong": { "$ref": "#/$defs/colorValue" },
+        "text-0": { "$ref": "#/$defs/colorValue" }, "text-1": { "$ref": "#/$defs/colorValue" }, "text-2": { "$ref": "#/$defs/colorValue" }, "text-3": { "$ref": "#/$defs/colorValue" },
+        "accent": { "$ref": "#/$defs/colorValue" }, "accent-dim": { "$ref": "#/$defs/colorValue" }, "accent-bd": { "$ref": "#/$defs/colorValue" }, "accent-fg": { "$ref": "#/$defs/colorValue" },
+        "selection": { "$ref": "#/$defs/colorValue" }, "selection-fg": { "$ref": "#/$defs/colorValue" }, "status": { "$ref": "#/$defs/colorValue" }, "status-fg": { "$ref": "#/$defs/colorValue" },
+        "live": { "$ref": "#/$defs/colorValue" }, "live-dim": { "$ref": "#/$defs/colorValue" }, "live-bd": { "$ref": "#/$defs/colorValue" }, "compact-zone": { "$ref": "#/$defs/colorValue" },
+        "success": { "$ref": "#/$defs/colorValue" }, "success-dim": { "$ref": "#/$defs/colorValue" }, "success-bd": { "$ref": "#/$defs/colorValue" },
+        "danger": { "$ref": "#/$defs/colorValue" }, "danger-dim": { "$ref": "#/$defs/colorValue" }, "danger-bd": { "$ref": "#/$defs/colorValue" }, "danger-fg": { "$ref": "#/$defs/colorValue" },
+        "warning": { "$ref": "#/$defs/colorValue" }, "warning-dim": { "$ref": "#/$defs/colorValue" }, "warning-bd": { "$ref": "#/$defs/colorValue" }, "warning-fg": { "$ref": "#/$defs/colorValue" },
+        "grid": { "$ref": "#/$defs/colorValue" }, "scrim": { "$ref": "#/$defs/colorValue" }, "shadow": { "$ref": "#/$defs/colorValue" }, "shadow-strong": { "$ref": "#/$defs/colorValue" }
+      }
+    },
+    "shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["radius-window", "radius-panel", "radius-card", "radius-button", "radius-input", "radius-pill", "radius-badge", "border-width", "focus-ring-width"],
+      "properties": {
+        "radius-window": { "$ref": "#/$defs/shapeValue" }, "radius-panel": { "$ref": "#/$defs/shapeValue" }, "radius-card": { "$ref": "#/$defs/shapeValue" },
+        "radius-button": { "$ref": "#/$defs/shapeValue" }, "radius-input": { "$ref": "#/$defs/shapeValue" }, "radius-pill": { "$ref": "#/$defs/shapeValue" }, "radius-badge": { "$ref": "#/$defs/shapeValue" },
+        "border-width": { "$ref": "#/$defs/shapeValue" }, "focus-ring-width": { "$ref": "#/$defs/shapeValue" }
+      }
+    }
+  },
+  "$defs": {
+    "colorValue": {
+      "type": "string",
+      "pattern": "^(?:#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})|rgb\\( *(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d) *, *(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d) *, *(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d) *\\)|rgba\\( *(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d) *, *(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d) *, *(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d) *, *(?:0(?:\\.\\d+)?|1(?:\\.0+)?|\\.\\d+) *\\))$"
+    },
+    "shapeValue": {
+      "type": "string",
+      "pattern": "^(?:0|(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:px|rem|em))$"
+    }
+  }
+}

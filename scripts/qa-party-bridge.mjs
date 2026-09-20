@@ -1,0 +1,580 @@
+/*
+ * Integration test for the party in-process MCP bridge
+ * (the party-communication design). Drives the REAL PartyApplicationService with a
+ * fake SessionManager so no Claude session is spawned, then exercises the bridge
+ * that the service hands to a member's session — verifying the whole chain:
+ *
+ *   MCP tool (buildPartyToolDefs + real SDK `tool`)
+ *     -> PartyBridge (identity-stamped `from`)
+ *       -> PartyApplicationService.sendMessage / createMember / removeMember
+ *         -> fake SessionManager (capture)
+ *
+ * Asserts: identity is closure-bound (from is never agent input), member-create
+ * auto-starts and persists reasoning, codex is accepted, sending to an off/absent
+ * member errors, list returns bounded summaries plus opt-in member detail,
+ * list-models returns rich data, and broadcasts fire.
+ */
+import { build } from "esbuild";
+import { mkdtempSync, mkdirSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { qaTempDir } from "./lib/qaTemp.mjs";
+
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const qaDir = qaTempDir();
+
+const failures = [];
+const assert = (cond, msg) => { console.log(`  ${cond ? "✓" : "✗"} ${msg}`); if (!cond) failures.push(msg); };
+
+async function load(entry, name) {
+  const out = path.join(qaDir, name);
+  await build({ entryPoints: [path.join(projectRoot, entry)], bundle: true, format: "esm", platform: "node", outfile: out, logLevel: "silent",
+    external: ["@anthropic-ai/claude-agent-sdk"] });
+  return import(pathToFileURL(out).href);
+}
+
+const { PartyApplicationService } = await load("src/main/application/partyApplicationService.ts", "party-svc.mjs");
+const { adaptPartyPrimerForCodex, buildCodexPartyCoreInstructions, buildCodexPartyDynamicToolSpecs, buildPartyDynamicToolSpec, buildPartyToolDefs, buildPartyPrimer, codexPartyCoreToolNameOf, invokePartyTool, PARTY_CODEX_CORE_TOOL_ALIASES, PARTY_CORE_TOOL_NAMES, PARTY_MCP_SERVER, PARTY_TOOL_NAMES, PARTY_TOOL_PREFIX } = await load("src/core/partyBridge.ts", "party-bridge.mjs");
+const sdk = await import("@anthropic-ai/claude-agent-sdk");
+
+// --- Fake SessionManager: captures bindings, never spawns a real session ------
+const workspace = mkdtempSync(path.join(os.tmpdir(), "agentparty-qa-"));
+const live = new Set();
+const captured = [];
+const sentTurns = [];
+const interrupted = [];
+const permissionChanges = [];
+const snapshots = new Map();
+let notifyCount = 0;
+let seq = 0;
+// Captures the resume id passed to createSession, so respawn's conversation-
+// continuity (resume the harness thread) can be asserted. A session's harness
+// thread id is deterministic (`thread-<sessionId>`).
+const resumedWith = [];
+const sessionManager = {
+  // The service subscribes to session events (it records a member's harness
+  // thread as soon as a turn commits, #19). This fake emits nothing, so the
+  // subscription is inert here — but it has to EXIST, because the real
+  // dependency is an EventEmitter and a stand-in missing part of that contract
+  // breaks at construction instead of in an assertion.
+  on: () => undefined,
+  createSession(input, resume, binding) {
+    const id = `sess-${++seq}`;
+    live.add(id);
+    snapshots.set(id, { status: "idle", turnCount: 0, pendingApprovalCount: 0, model: input.model });
+    captured.push(binding);
+    resumedWith.push(resume);
+    return { id, title: "t", workspace: input.workspacePath, snapshot: snapshots.get(id) };
+  },
+  harnessSessionId(id) { return live.has(id) ? `thread-${id}` : undefined; },
+  createMockSession(input) {
+    const id = `mock-${++seq}`; live.add(id);
+    snapshots.set(id, { status: "idle", turnCount: 0, pendingApprovalCount: 0, model: input.model });
+    return { id, title: "t", workspace: input.workspacePath, snapshot: snapshots.get(id) };
+  },
+  hasSession(id) { return live.has(id); },
+  sendUserTurn(id, text) { sentTurns.push({ id, text }); },
+  closeSession(id) { live.delete(id); },
+  interrupt(id) { interrupted.push(id); },
+  setPermissionMode(id, permissionMode) { permissionChanges.push({ id, permissionMode }); },
+  setCodexPolicy(id, codexPolicy) { permissionChanges.push({ id, codexPolicy }); },
+  setModel() {},
+  setEffort() {},
+  // A session is "compacting" while its id is in this set (the real manager sets it
+  // in compact() and clears it on the outcome). Interrupt-on-send must respect it.
+  compacting: new Set(),
+  isCompacting(id) { return this.compacting.has(id); },
+  listSessions() { return [...live].map((id) => ({ id, title: "t", workspace, snapshot: snapshots.get(id) || {} })); },
+  notifyPartyChanged() { notifyCount += 1; },
+  // Live codex catalog: discovered, so list-models must expose it per-harness.
+  getCodexModelState() {
+    return { status: "ready", models: [{ model: "gpt-5.5", displayName: "GPT-5.5", isDefault: true, hidden: false, defaultReasoningEffort: "medium", reasoningEfforts: [{ id: "low" }, { id: "medium" }, { id: "high" }, { id: "xhigh" }], serviceTiers: [{ id: "priority", name: "Fast", description: "QA Fast tier" }] }] };
+  },
+};
+
+const svc = new PartyApplicationService({ sessionManager, getWorkspacePath: () => workspace });
+
+console.log("\nParty bridge assertions:");
+
+// Create a party: `main` is auto-created AND its session auto-init'd (no turn).
+const created = svc.createParty({ name: "team-qa" });
+const partyId = created.member?.partyId || created.currentPartyId;
+assert(captured.length === 1, "creating a party auto-starts main's session (exactly one binding)");
+// main is born from the single runtime default profile (harness + model).
+assert(created.member?.name === "main" && created.member?.runtime === "claude-code" && created.member?.model === "sonnet", "main is created from the runtime default profile");
+const mainBinding = captured[0];
+assert(mainBinding?.identity?.member === "main" && mainBinding?.identity?.party === partyId, "binding identity is closure-bound to the member (party + name)");
+const bridge = mainBinding.bridge;
+
+// --- list-models: rich discovery --------------------------------------------
+const models = await bridge.listModels();
+assert(models.ok && Array.isArray(models.data?.harnesses), "list-models returns harnesses");
+const harnessIds = models.data.harnesses.map((h) => h.id);
+assert(harnessIds.includes("claude-code") && harnessIds.includes("codex") && harnessIds.includes("cursor"), "claude-code, codex, and cursor harnesses are exposed");
+assert(models.data.harnesses.find((h) => h.id === "codex")?.status === "available", "codex is marked available");
+assert(Array.isArray(models.data.models) && models.data.models.length > 5, "list-models returns the model catalog");
+assert(models.data.models.some((m) => typeof m.perf === "number" && m.context), "models carry rich meta (perf + context)");
+assert(models.data.harnesses.every((h) => h.permission?.kind), "each harness exposes its member-create permission contract + default");
+// Any filter requests detail rows; the no-argument index intentionally omits
+// per-route fields to keep discovery compact.
+const detailedModels = await bridge.listModels({ query: "gpt" });
+assert(detailedModels.data.models.some((m) => m.reasoning && (m.reasoning.effort || m.reasoning.thinking)), "at least one detailed model exposes reasoning options");
+assert(detailedModels.data.models.every((m) => ["claude-code", "codex", "cursor", "grok"].includes(m.harness)), "every detailed model states its harness (member-create needs it)");
+assert(detailedModels.data.models.every((m) => ["claude-code", "codex", "cursor", "grok"].includes(m.executionHarness)), "every detailed model states its concrete execution harness");
+const codexListed = detailedModels.data.models.filter((m) => m.harness === "codex");
+assert(codexListed.some((m) => m.id === "gpt-5.5"), "the live codex catalog rides into list-models");
+assert(codexListed.find((m) => m.id === "gpt-5.5")?.reasoning?.effort?.options?.length === 4, "codex models expose effort options (effort-only reasoning)");
+
+// --- member-create: codex accepted ------------------------------------------
+const initialCodexPolicy = { sandbox: "read-only", approval: "on-request", guardian: false };
+const codex = await bridge.createMember({ name: "cx", role: "x", harness: "codex", codexPolicy: initialCodexPolicy });
+assert(codex.ok && svc.list().members.find((m) => m.name === "cx")?.runtime === "codex", "member-create accepts codex harness");
+assert(captured.length === 2, "codex member-create starts a codex session");
+assert(JSON.stringify(svc.list().members.find((m) => m.name === "cx")?.codexPolicy) === JSON.stringify(initialCodexPolicy), "member-create persists an explicit initial Codex policy");
+assert(svc.getPartyLayout(partyId)?.panels.some((panel) => panel.tabs.length === 1 && panel.tabs[0] === "cx"), "member-create without tabGroup opens its own new tab group");
+const invalidGroup = await bridge.createMember({ name: "lost", role: "must not be created", tabGroup: "closed-member" });
+assert(!invalidGroup.ok && /not open/i.test(invalidGroup.error || ""), "member-create rejects a closed or unknown tabGroup instead of guessing");
+assert(!svc.list().members.some((member) => member.name === "lost"), "invalid tabGroup is validated before the member is created");
+const layoutBeforeAmbiguity = svc.getPartyLayout(partyId);
+svc.setPartyLayout({
+  panels: [
+    { id: "duplicate-a", tabs: ["main"], active: "main", weight: 1 },
+    { id: "duplicate-b", tabs: ["main"], active: "main", weight: 1 },
+  ],
+  focusedPanelId: "duplicate-a",
+}, partyId);
+const ambiguousGroup = await bridge.createMember({ name: "ambiguous", role: "must not be created", tabGroup: "main" });
+assert(!ambiguousGroup.ok && /ambiguous/i.test(ambiguousGroup.error || ""), "member-name shorthand is rejected when a split makes it ambiguous");
+assert(!svc.list().members.some((member) => member.name === "ambiguous"), "ambiguous shorthand does not half-create a member");
+svc.setPartyLayout(layoutBeforeAmbiguity, partyId);
+const changedCodexPolicy = { sandbox: "workspace-write", approval: "never", guardian: true };
+const changedCx = await bridge.setPermission("cx", { codexPolicy: changedCodexPolicy });
+assert(changedCx.ok && JSON.stringify(svc.list().members.find((m) => m.name === "cx")?.codexPolicy) === JSON.stringify(changedCodexPolicy), "one member can change another Codex member's policy");
+assert(permissionChanges.some((change) => change.codexPolicy?.guardian === true), "live Codex permission change reaches the target adapter");
+
+// --- member-runtime: catalog-validated model / effort / Fast ----------------
+const cxSessionBeforeRuntime = svc.list().members.find((m) => m.name === "cx")?.sessionId;
+snapshots.get(cxSessionBeforeRuntime).status = "responding";
+const busyRuntime = await bridge.setRuntime("cx", { model: "gpt-5.5", effort: "high", fast: true });
+assert(!busyRuntime.ok && /busy/i.test(busyRuntime.error || ""), "member-runtime refuses a restart while the target has an active turn");
+assert(svc.list().members.find((m) => m.name === "cx")?.serviceTier === undefined, "a refused busy runtime change does not mutate persisted settings");
+snapshots.get(cxSessionBeforeRuntime).status = "idle";
+const changedRuntime = await bridge.setRuntime("cx", { model: "gpt-5.5", effort: "high", fast: true });
+const cxAfterRuntime = svc.list().members.find((m) => m.name === "cx");
+assert(changedRuntime.ok && changedRuntime.data?.fast === true && changedRuntime.data?.serviceTier === "priority", "member-runtime maps fast=true to the model catalog's native Fast tier");
+assert(cxAfterRuntime?.effort === "high" && cxAfterRuntime?.serviceTier === "priority", "member-runtime persists model effort and native service tier together");
+assert(cxAfterRuntime?.sessionId !== cxSessionBeforeRuntime && changedRuntime.data?.restarted === true, "a Fast tier change respawns the session while preserving its conversation path");
+const invalidRuntime = await bridge.setRuntime("cx", { effort: "impossible" });
+assert(!invalidRuntime.ok && /Use: low, medium, high, xhigh/.test(invalidRuntime.error || ""), "member-runtime rejects an unsupported effort with the valid options");
+assert(svc.list().members.find((m) => m.name === "cx")?.effort === "high", "an invalid runtime request leaves the member unchanged");
+await bridge.setRuntime("cx", { effort: "medium" });
+const baiRuntime = await bridge.setRuntime("cx", { model: "DeepSeek V4.1 Flash B.AI" });
+assert(baiRuntime.ok && svc.list().members.find((m) => m.name === "cx")?.effort === "high", "changing to B.AI without effort seeds its catalog default instead of carrying incompatible medium");
+const baiNone = await bridge.setRuntime("cx", { effort: "none" });
+assert(baiNone.ok && svc.list().members.find((m) => m.name === "cx")?.effort === "none", "member-runtime accepts the verified B.AI none effort");
+const selfRuntime = await bridge.setRuntime("main", { effort: "high" });
+assert(!selfRuntime.ok && /calling member/i.test(selfRuntime.error || ""), "member-runtime refuses to restart or mutate the caller during its own tool call");
+const emptyRuntime = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}member-runtime`, { name: "cx" });
+assert(!emptyRuntime.ok && /at least one/i.test(emptyRuntime.error || ""), "member-runtime requires at least one runtime field");
+const malformedRuntime = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}member-runtime`, { name: "cx", fast: "yes", effort: "low" });
+assert(!malformedRuntime.ok && /fast must be a boolean/i.test(malformedRuntime.error || ""), "member-runtime rejects a malformed field instead of partially applying the valid fields beside it");
+
+const baiCreated = await bridge.createMember({ name: "bai-default", role: "B.AI default QA", harness: "codex", model: "DeepSeek V4.1 Flash B.AI" });
+assert(baiCreated.ok && svc.list().members.find((m) => m.name === "bai-default")?.effort === "high", "member-create seeds the B.AI model default when the Codex harness default is incompatible");
+const invalidBaiCreate = await bridge.createMember({ name: "bai-invalid", role: "must fail", harness: "codex", model: "DeepSeek V4.1 Flash B.AI", effort: "medium" });
+assert(!invalidBaiCreate.ok && /Use: none, low, high, max/.test(invalidBaiCreate.error || ""), "member-create rejects an explicit effort the selected B.AI model does not advertise");
+assert(!svc.list().members.some((member) => member.name === "bai-invalid"), "invalid member-create leaves no partial member behind");
+svc.createMember({ name: "runtime-race", requirement: "latest runtime wins", runtime: "codex", model: "gpt-5.4", effort: "medium", partyId });
+await bridge.setRuntime("runtime-race", { model: "DeepSeek V4.1 Flash B.AI", effort: "max" });
+svc.startMember("runtime-race", { auto: true, model: "gpt-5.4", effort: "medium" }, {}, partyId);
+const runtimeRace = svc.list().members.find((member) => member.name === "runtime-race");
+assert(runtimeRace?.model === "DeepSeek V4.1 Flash B.AI" && runtimeRace?.effort === "max", "stale auto-prewarm arguments cannot overwrite a later pre-session runtime change");
+
+// --- member-create: claude-code auto-starts + persists reasoning -------------
+const make = await bridge.createMember({ name: "reviewer", role: "Code reviewer", tabGroup: "main", harness: "claude-code", model: "sonnet", reasoning: "enabled", permissionMode: "plan" });
+assert(make.ok, "member-create (claude-code) succeeds");
+assert(captured.some((binding) => binding.identity?.member === "reviewer"), "member-create auto-starts the new member's session");
+const reviewer = svc.list().members.find((m) => m.name === "reviewer");
+assert(reviewer?.reasoning === "enabled", "reasoning is persisted on the created member");
+assert(reviewer?.status === "running", "created member is live");
+assert(reviewer?.permissionMode === "plan", "member-create persists an explicit initial Claude permission");
+const mainPanel = svc.getPartyLayout(partyId)?.panels.find((panel) => panel.tabs.includes("main"));
+assert(mainPanel?.tabs.includes("reviewer") && mainPanel.active === "reviewer", "member-create tabGroup appends to and activates the anchored member's group");
+const beforeDuplicateStart = captured.length;
+const reusedReviewer = svc.startMember("reviewer", { auto: true }, {}, partyId);
+assert(reusedReviewer.session?.id === reviewer?.sessionId && captured.length === beforeDuplicateStart, "concurrent/prewarm start reuses the live session instead of orphaning a duplicate");
+const changedReviewer = await bridge.setPermission("reviewer", { permissionMode: "auto" });
+assert(changedReviewer.ok && svc.list().members.find((m) => m.name === "reviewer")?.permissionMode === "auto", "one member can change another Claude member's permission");
+
+// --- send: delivered, with from stamped to the caller (not agent input) ------
+const before = sentTurns.length;
+const sent = await bridge.send("main", "reviewer", "please review PR 42");
+assert(sent.ok, "send to a running member succeeds");
+assert(sentTurns.length === before + 1, "send delivered one turn into the target session");
+assert(/from="main"/.test(sentTurns[before].text) && /please review PR 42/.test(sentTurns[before].text), "delivered payload is channel-wrapped with from=main");
+
+// --- send: errors for absent / off members ----------------------------------
+const ghost = await bridge.send("main", "ghost", "hi");
+assert(!ghost.ok && /does not exist/i.test(ghost.error || ""), "send to a nonexistent member errors");
+
+// --- list: bounded summary + one-member detail -------------------------------
+const listed = await bridge.list();
+const names = (listed.data?.members || []).map((m) => m.name);
+assert(listed.ok && names.includes("main") && names.includes("reviewer"), "list returns the party members");
+assert(listed.data?.detail === "summary" && listed.data?.totalMembers === names.length, "list labels the bounded summary and reports the total member count");
+assert(listed.data?.tabGroups?.some((group) => group.id && group.anchor === "reviewer" && group.members.includes("main")), "list exposes current tab groups and an exact reusable member-create id");
+assert(listed.data.members.find((m) => m.name === "reviewer")?.harness === "claude-code", "list carries harness per member");
+assert(!("gate" in listed.data.members[0]) && !("model" in listed.data.members[0]) && !("location" in listed.data.members[0]), "list summary omits repeated member configuration and gate rules");
+const reviewerDetail = await bridge.list({ name: "reviewer" });
+assert(reviewerDetail.ok && reviewerDetail.data?.detail === "member" && reviewerDetail.data?.members?.length === 1, "list name filter returns exactly one detailed member");
+assert(reviewerDetail.data?.members?.[0]?.name === "reviewer" && reviewerDetail.data.members[0].model === "sonnet" && reviewerDetail.data.members[0].gate?.send?.rule !== undefined && reviewerDetail.data.members[0].gate?.recv?.rule !== undefined, "one-member detail keeps model and both effective gate settings inspectable");
+const missingDetail = await bridge.list({ name: "ghost" });
+assert(!missingDetail.ok && /does not exist/i.test(missingDetail.error || ""), "list name filter fails visibly for an unknown member");
+
+// A different process/window can move the advisory last-active hint while this
+// bridge remains bound to its own party. Removing a member must return that
+// acted-on party's view, close only that member's session, and leave the other
+// party byte-for-byte equivalent at the service boundary.
+const scopeProbeCreated = await bridge.createMember({ name: "scope-probe", role: "remove scope QA", harness: "claude-code" });
+assert(scopeProbeCreated.ok, "created a scoped member-removal probe");
+const scopeProbeSession = svc.list(partyId).members.find((m) => m.name === "scope-probe")?.sessionId;
+const otherCreated = svc.createParty({ name: "other-party" });
+const otherPartyId = otherCreated.member?.partyId || otherCreated.currentPartyId;
+const otherMembersBefore = svc.list(otherPartyId).members.map((m) => `${m.partyId}/${m.name}/${m.sessionId || ""}`).sort();
+const scopedRemoval = svc.removeMember("scope-probe", partyId);
+assert(scopedRemoval.currentPartyId === partyId, "member removal result stays scoped to the acted-on party when the global hint points elsewhere");
+assert(!scopedRemoval.members.some((m) => m.name === "scope-probe"), "scoped removal result excludes the deleted member");
+assert(scopeProbeSession && !live.has(scopeProbeSession), "scoped removal still closes the deleted member's session");
+const otherMembersAfter = svc.list(otherPartyId).members.map((m) => `${m.partyId}/${m.name}/${m.sessionId || ""}`).sort();
+assert(JSON.stringify(otherMembersAfter) === JSON.stringify(otherMembersBefore), "scoped removal leaves the other party unchanged");
+svc.selectParty(partyId);
+
+const rmRev = await bridge.removeMember("reviewer");
+assert(rmRev.ok, "member-remove removes a normal member");
+assert(!svc.list().members.some((m) => m.name === "reviewer"), "removed member is gone from party state");
+
+assert(notifyCount >= 3, `party broadcasts fired on bridge mutations (got ${notifyCount})`);
+
+// --- member-status / interrupt / broadcast (agent coordination tools) ---------
+console.log("\nCoordination tool assertions:");
+await bridge.createMember({ name: "worker1", role: "r", harness: "claude-code" });
+await bridge.createMember({ name: "worker2", role: "r", harness: "claude-code" });
+const memberSession = (name) => svc.list().members.find((m) => m.name === name)?.sessionId;
+
+// member-status: idle members read as not turnActive; a busy one flips.
+const allStatus = await bridge.status();
+assert(allStatus.ok && allStatus.data.members.length >= 3, "member-status without a name returns every member");
+assert(allStatus.data.members.every((m) => m.turnActive === false && m.running === true), "idle members report turnActive=false, running=true");
+snapshots.get(memberSession("worker1")).status = "responding";
+const oneStatus = await bridge.status("worker1");
+assert(oneStatus.ok && oneStatus.data.members.length === 1 && oneStatus.data.members[0].turnActive === true && oneStatus.data.members[0].status === "responding", "a mid-turn member reports turnActive=true");
+const ghostStatus = await bridge.status("ghost");
+assert(!ghostStatus.ok && /does not exist/i.test(ghostStatus.error || ""), "member-status for a nonexistent member errors");
+
+// interrupt: self is refused; a busy member is stopped; an idle one is a no-op report.
+const selfInterrupt = await bridge.interrupt("main");
+assert(!selfInterrupt.ok && /yourself/i.test(selfInterrupt.error || ""), "interrupt refuses the caller itself");
+const stopBusy = await bridge.interrupt("worker1");
+assert(stopBusy.ok && stopBusy.data.interrupted.includes("worker1") && interrupted.includes(memberSession("worker1")), "interrupting a busy member stops its session");
+const stopIdle = await bridge.interrupt("worker2");
+assert(stopIdle.ok && stopIdle.data.interrupted.length === 0 && stopIdle.data.idle.includes("worker2"), "interrupting an idle member reports idle (not an error, no adapter call)");
+
+// interrupt all: stops every busy member EXCEPT the caller.
+snapshots.get(memberSession("worker1")).status = "responding";
+snapshots.get(memberSession("worker2")).status = "requesting";
+snapshots.get(memberSession("main")).status = "responding";
+const beforeAll = interrupted.length;
+const stopAll = await bridge.interrupt("all");
+assert(stopAll.ok && stopAll.data.interrupted.sort().join() === "worker1,worker2", "interrupt 'all' stops every busy member except the caller");
+assert(interrupted.length === beforeAll + 2 && !interrupted.slice(beforeAll).includes(memberSession("main")), "the caller's own session is never interrupted by 'all'");
+snapshots.get(memberSession("main")).status = "idle";
+
+// send with interrupt: a busy recipient's turn is stopped; the message parks at
+// the FRONT of the app queue and is NOT handed to the harness yet (#23).
+snapshots.get(memberSession("worker2")).status = "responding";
+const beforeInj = { interrupts: interrupted.length, turns: sentTurns.length };
+const inject = await bridge.send("main", "worker2", "urgent: stop and read this", true);
+const urgentQueue = svc.getMemberQueue("worker2", partyId);
+assert(inject.ok && interrupted.length === beforeInj.interrupts + 1 && sentTurns.length === beforeInj.turns, "send(interrupt=true) stops the busy recipient without handing the harness a turn");
+assert(urgentQueue.items[0]?.text === "urgent: stop and read this", "…and parks the urgent message at the front of the app queue");
+assert(inject.data?.queued === true, "…reported as queued (not failed) so the sender will not duplicate-resend");
+const beforeQueue = interrupted.length;
+snapshots.get(memberSession("worker2")).status = "idle";
+await bridge.send("main", "worker2", "normal follow-up", true);
+assert(interrupted.length === beforeQueue, "send(interrupt=true) to an idle recipient skips the interrupt");
+
+// send with interrupt to a COMPACTING recipient: even though it is busy, the
+// compaction is NOT torn down — the interrupt is suppressed; the message still
+// parks as a cut-in on the app queue (not the harness buffer).
+svc.clearMemberQueue("worker2", partyId);
+snapshots.get(memberSession("worker2")).status = "responding";
+sessionManager.compacting.add(memberSession("worker2"));
+const beforeCompact = { interrupts: interrupted.length, turns: sentTurns.length };
+const compactSend = await bridge.send("main", "worker2", "don't cut the compaction", true);
+const compactQueue = svc.getMemberQueue("worker2", partyId);
+assert(compactSend.ok && interrupted.length === beforeCompact.interrupts && sentTurns.length === beforeCompact.turns, "send(interrupt=true) to a COMPACTING recipient skips the interrupt and does not hand the harness a turn");
+assert(compactQueue.items[0]?.text === "don't cut the compaction" && compactQueue.items[0]?.cutIn === true, "…and parks as a cut-in on the app queue while the compaction finishes");
+sessionManager.compacting.delete(memberSession("worker2"));
+snapshots.get(memberSession("worker2")).status = "idle";
+svc.clearMemberQueue("worker2", partyId);
+
+// Omitted interrupt inherits: explicit call > sender override > Runtime default.
+console.log("\nMember message interrupt defaults:");
+snapshots.get(memberSession("worker2")).status = "responding";
+svc.setMemberMessaging({ interruptOnSend: true });
+svc.setMemberOutboundInterrupt("main", null, partyId);
+const beforeDefaultInterrupt = interrupted.length;
+await bridge.send("main", "worker2", "runtime-default-cut-in");
+let inheritedQueue = svc.getMemberQueue("worker2", partyId);
+assert(interrupted.length === beforeDefaultInterrupt + 1 && inheritedQueue.items[0]?.cutIn === true, "omitted interrupt inherits the Runtime true default");
+
+svc.setMemberOutboundInterrupt("main", false, partyId);
+const beforeMemberQueue = interrupted.length;
+await bridge.send("main", "worker2", "member-override-queue");
+inheritedQueue = svc.getMemberQueue("worker2", partyId);
+assert(interrupted.length === beforeMemberQueue && inheritedQueue.items.at(-1)?.text === "member-override-queue", "sender false override queues behind and beats Runtime true");
+
+const beforeExplicit = interrupted.length;
+await bridge.send("main", "worker2", "explicit-cut-in", true);
+inheritedQueue = svc.getMemberQueue("worker2", partyId);
+assert(interrupted.length === beforeExplicit + 1 && inheritedQueue.items.find((item) => item.text === "explicit-cut-in")?.cutIn === true, "explicit true beats the sender false override");
+svc.setMemberOutboundInterrupt("main", null, partyId);
+svc.setMemberMessaging({ interruptOnSend: false });
+snapshots.get(memberSession("worker2")).status = "idle";
+svc.clearMemberQueue("worker2", partyId);
+
+// broadcast: every other member gets the channel-wrapped message; self excluded.
+// A BUSY recipient's copy goes to its QUEUE instead of being injected — worker1
+// is still mid-turn from the interrupt leg above. That is a third outcome,
+// deliberately not folded into `failed`: telling the sender that a message which
+// is merely waiting has failed invites a duplicate resend.
+const beforeBc = sentTurns.length;
+const bc = await bridge.broadcast("전체 공지");
+const reached = [...bc.data.delivered, ...(bc.data.queuedMembers || [])];
+assert(bc.ok && reached.length >= 3 && !reached.includes("main"), "broadcast reaches every member except the caller");
+assert(bc.data.queuedMembers?.includes("worker1"), "a BUSY recipient is reported as queued, not as failed");
+assert(!bc.data.failed.some((f) => f.name === "worker1"), "…and does not also appear in failed");
+assert(sentTurns.length === beforeBc + bc.data.delivered.length, "broadcast injected one turn per DELIVERED recipient (the queued one waits)");
+assert(sentTurns.slice(beforeBc).every((t) => /from="main"/.test(t.text) && /전체 공지/.test(t.text)), "broadcast payloads are channel-wrapped with from=main");
+// A member without a live session lands in failed, never silently dropped.
+svc.closeMember("worker1", partyId);
+// Auto-start (renderer prewarm) must NOT resurrect a closed member — the
+// prewarm-vs-close race silently reopened a just-closed member with a fresh
+// session (and a queued message then got delivered to it).
+const autoStart = svc.startMember("worker1", { auto: true }, {}, partyId);
+assert(autoStart.ok && autoStart.member?.status === "closed" && !autoStart.session, "auto-start on a closed member is skipped (stays closed, no session)");
+const bc2 = await bridge.broadcast("두번째 공지", true);
+assert(bc2.ok && bc2.data.failed.some((f) => f.name === "worker1"), "broadcast reports undeliverable members in failed");
+assert(!bc2.data.delivered.includes("worker1"), "closed member is not counted as delivered");
+const deliberate = svc.startMember("worker1", {}, {}, partyId);
+assert(Boolean(deliberate.session?.id) && deliberate.member?.status === "running", "a deliberate start still reopens a closed member");
+svc.closeMember("worker1", partyId);
+
+// --- MCP glue: buildPartyToolDefs wires real SDK tools to the bridge ----------
+console.log("\nMCP tool surface assertions:");
+assert(PARTY_MCP_SERVER === "agentparty-app", "MCP server name is agentparty-app");
+assert(PARTY_TOOL_PREFIX === "mcp__agentparty-app__", "namespaced tool prefix matches");
+const defs = buildPartyToolDefs(sdk.tool, bridge, mainBinding.identity);
+const toolNames = defs.map((d) => d.name);
+assert(JSON.stringify(toolNames) === JSON.stringify(PARTY_TOOL_NAMES), "in-process MCP exposes every canonical party tool in order");
+// Re-create a target so the send tool delivers, then invoke the real handler.
+await bridge.createMember({ name: "buddy", role: "r", harness: "claude-code" });
+const sendTool = defs.find((d) => d.name === "send");
+const n2 = sentTurns.length;
+const out = await sendTool.handler({ to: "buddy", content: "ping" });
+assert(Array.isArray(out.content) && out.content[0].type === "text", "send tool returns an MCP text envelope");
+assert(out.isError === false, "successful send is not flagged as error");
+assert(sentTurns.length === n2 + 1 && /from="main"/.test(sentTurns[n2].text), "tool handler stamps from=main (identity, not args)");
+
+// Batch coordination uses the same handlers and preserves per-target results.
+const memberCreateTool = defs.find((d) => d.name === "member-create");
+const batchCreated = await memberCreateTool.handler({ members: [
+  { name: "batch-a", role: "batch worker A", harness: "claude-code" },
+  { name: "batch-b", role: "batch worker B", harness: "claude-code" },
+] });
+const batchCreatedData = JSON.parse(batchCreated.content[0].text);
+assert(batchCreated.isError === false && batchCreatedData.created.length === 2 && batchCreatedData.failed.length === 0, "member-create accepts a members array and reports every created member");
+assert(svc.list().members.some((m) => m.name === "batch-a") && svc.list().members.some((m) => m.name === "batch-b"), "batch-created members are persisted and started");
+const beforeBatchSend = sentTurns.length;
+const batchSent = await sendTool.handler({ to: ["batch-a", "batch-b"], content: "same batch message" });
+const batchSentData = JSON.parse(batchSent.content[0].text);
+assert(batchSent.isError === false && batchSentData.delivered.sort().join() === "batch-a,batch-b" && batchSentData.failed.length === 0, "send accepts multiple recipients and separates delivered from failed");
+assert(sentTurns.length === beforeBatchSend + 2, "multi-recipient send injects exactly one turn per target");
+const duplicateBatchSend = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}send`, { to: ["batch-a", "batch-a"], content: "must not duplicate" });
+assert(!duplicateBatchSend.ok && /duplicate/i.test(duplicateBatchSend.error || ""), "multi-recipient send rejects duplicate targets before delivery");
+const duplicateBatchCreate = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}member-create`, { members: [
+  { name: "duplicate-batch", role: "first" },
+  { name: "duplicate-batch", role: "second" },
+] });
+assert(!duplicateBatchCreate.ok && /duplicate/i.test(duplicateBatchCreate.error || "") && !svc.list().members.some((m) => m.name === "duplicate-batch"), "batch creation rejects duplicate names before creating anything");
+
+// --- Codex dynamic tool glue: same bridge, Codex protocol shape --------------
+console.log("\nCodex dynamic tool assertions:");
+const dynamic = buildPartyDynamicToolSpec();
+assert(dynamic.type === "namespace" && dynamic.name === PARTY_MCP_SERVER, "Codex dynamic tools use the agentparty-app namespace");
+assert(JSON.stringify(dynamic.tools.map((tool) => tool.name)) === JSON.stringify(toolNames), "Codex dynamic tools expose the same canonical party tools");
+assert(dynamic.tools.every((tool) => tool.deferLoading === true), "complete Codex compatibility namespace is deferred");
+const codexDynamic = buildCodexPartyDynamicToolSpecs();
+const eagerCore = codexDynamic.filter((tool) => tool.type === "function");
+assert(eagerCore.length === PARTY_CORE_TOOL_NAMES.length, "Codex exposes only the five Party Core controls eagerly");
+assert(eagerCore.every((tool) => tool.deferLoading === false), "Codex Party Core aliases explicitly bypass deferred loading");
+assert(JSON.stringify(eagerCore.map((tool) => tool.name)) === JSON.stringify(Object.keys(PARTY_CODEX_CORE_TOOL_ALIASES)), "Codex Party Core aliases have stable short names");
+assert(codexPartyCoreToolNameOf("party_send") === "send" && codexPartyCoreToolNameOf("party_status") === "member-status", "Codex Party Core aliases normalize to canonical tool names");
+const codexCoreInstructions = buildCodexPartyCoreInstructions();
+assert(codexCoreInstructions.includes("tools.party_send") && codexCoreInstructions.includes("never scan `ALL_TOOLS`"), "Codex instructions teach the eager alias without catalog enumeration");
+const codexPrimer = adaptPartyPrimerForCodex(buildPartyPrimer({ party: "qa", member: "main" }));
+assert(codexPrimer.includes("party_send") && !codexPrimer.includes(`${PARTY_TOOL_PREFIX}send`), "Codex primer consistently uses the eager send alias");
+assert(codexPrimer.includes(`${PARTY_TOOL_PREFIX}member-create`), "Codex primer keeps long-tail tools on the deferred canonical surface");
+assert(codexPrimer.includes(`${PARTY_TOOL_PREFIX}list-models`) && !codexPrimer.includes("party_list-models"), "Codex core list replacement does not corrupt longer tool names");
+const dynamicSendSpec = dynamic.tools.find((tool) => tool.name === "send")?.inputSchema;
+assert(dynamicSendSpec?.properties?.interrupt?.type === "boolean" && dynamicSendSpec?.properties?.queue?.type === "boolean", "member send exposes separate interrupt and queue delivery flags");
+assert(Array.isArray(dynamicSendSpec?.properties?.to?.oneOf), "dynamic send schema exposes string-or-array recipients");
+assert(dynamic.tools.find((tool) => tool.name === "member-create")?.inputSchema?.properties?.members?.type === "array", "dynamic member-create schema exposes the members batch field");
+assert(dynamic.tools.find((tool) => tool.name === "member-create")?.inputSchema?.properties?.location?.properties?.server?.type === "string", "dynamic member-create schema exposes the SSH server alias");
+assert(Array.isArray(dynamic.tools.find((tool) => tool.name === "member-remove")?.inputSchema?.properties?.name?.oneOf), "dynamic member-remove schema exposes string-or-array names");
+assert(dynamic.tools.find((tool) => tool.name === "member-runtime")?.inputSchema?.properties?.fast?.type === "boolean", "dynamic member-runtime schema exposes Fast as a boolean");
+assert(dynamic.tools.find((tool) => tool.name === "gate-set")?.inputSchema?.properties?.axis?.enum?.join() === "send,recv", "dynamic gate-set schema exposes the send/recv axis");
+assert(dynamic.tools.find((tool) => tool.name === "party-gate-set")?.inputSchema?.properties?.axis?.enum?.join() === "send,recv", "dynamic party-gate-set schema exposes the send/recv axis");
+assert(dynamic.tools.find((tool) => tool.name === "broadcast")?.inputSchema?.properties?.exclude?.type === "array", "dynamic broadcast schema exposes excluded members");
+assert(dynamic.tools.find((tool) => tool.name === "list")?.inputSchema?.properties?.name?.type === "string", "dynamic list schema exposes the exact-name detail filter");
+const beforeDynamic = sentTurns.length;
+const dynamicOut = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}send`, { to: "buddy", content: "hello from codex" });
+assert(dynamicOut.ok, "Codex dispatcher accepts namespaced party tool names");
+assert(sentTurns.length === beforeDynamic + 1 && /from="main"/.test(sentTurns[beforeDynamic].text), "Codex dispatcher stamps from=main through the same bridge identity");
+
+// Real harness transcripts showed Codex materializing the old optional boolean
+// as `interrupt:false` on every call. That generated value must inherit rather
+// than silently disabling both Runtime and per-member interrupt preferences.
+snapshots.get(memberSession("buddy")).status = "responding";
+svc.clearMemberQueue("buddy", partyId);
+svc.setMemberOutboundInterrupt("main", null, partyId);
+svc.setMemberMessaging({ interruptOnSend: true });
+let beforeToolInterrupt = interrupted.length;
+let inheritedToolSend = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}send`, {
+  to: "buddy", content: "legacy-false-inherits-runtime", interrupt: false,
+});
+let buddyQueue = svc.getMemberQueue("buddy", partyId);
+assert(inheritedToolSend.ok && inheritedToolSend.data?.cutIn === true && interrupted.length === beforeToolInterrupt + 1 && buddyQueue.items[0]?.cutIn === true, "legacy tool interrupt:false inherits the Runtime true default");
+
+svc.clearMemberQueue("buddy", partyId);
+svc.setMemberMessaging({ interruptOnSend: false });
+svc.setMemberOutboundInterrupt("main", true, partyId);
+beforeToolInterrupt = interrupted.length;
+inheritedToolSend = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}send`, {
+  to: "buddy", content: "legacy-false-inherits-member", interrupt: false,
+});
+buddyQueue = svc.getMemberQueue("buddy", partyId);
+assert(inheritedToolSend.ok && inheritedToolSend.data?.cutIn === true && interrupted.length === beforeToolInterrupt + 1 && buddyQueue.items[0]?.cutIn === true, "legacy tool interrupt:false inherits a per-member true override");
+
+svc.clearMemberQueue("buddy", partyId);
+beforeToolInterrupt = interrupted.length;
+const forcedQueue = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}send`, {
+  to: "buddy", content: "explicit-tool-queue", queue: true,
+});
+buddyQueue = svc.getMemberQueue("buddy", partyId);
+assert(forcedQueue.ok && forcedQueue.data?.cutIn === false && interrupted.length === beforeToolInterrupt && buddyQueue.items[0]?.cutIn !== true, "queue:true explicitly queues even when the member override is true");
+
+svc.clearMemberQueue("buddy", partyId);
+svc.setMemberOutboundInterrupt("main", false, partyId);
+beforeToolInterrupt = interrupted.length;
+const forcedInterrupt = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}send`, {
+  to: "buddy", content: "explicit-tool-interrupt", interrupt: true,
+});
+buddyQueue = svc.getMemberQueue("buddy", partyId);
+assert(forcedInterrupt.ok && forcedInterrupt.data?.cutIn === true && interrupted.length === beforeToolInterrupt + 1 && buddyQueue.items[0]?.cutIn === true, "interrupt:true explicitly cuts in even when the member override is false");
+const conflictingDelivery = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}send`, {
+  to: "buddy", content: "ambiguous", interrupt: true, queue: true,
+});
+assert(!conflictingDelivery.ok && /only one delivery override/i.test(conflictingDelivery.error || ""), "conflicting interrupt/queue flags are rejected visibly");
+svc.clearMemberQueue("buddy", partyId);
+svc.setMemberOutboundInterrupt("main", null, partyId);
+svc.setMemberMessaging({ interruptOnSend: false });
+snapshots.get(memberSession("buddy")).status = "idle";
+const unknownDynamic = await invokePartyTool(bridge, mainBinding.identity, "mcp__agentparty__send", {});
+assert(!unknownDynamic.ok && /Unknown AgentParty tool/.test(unknownDynamic.error || ""), "Codex dispatcher rejects legacy agentparty tool names");
+const dynamicPermission = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}member-permission`, { name: "buddy", permissionMode: "plan" });
+assert(dynamicPermission.ok && svc.list().members.find((m) => m.name === "buddy")?.permissionMode === "plan", "Codex dispatcher routes member-permission through the shared bridge");
+// gate-set: any member may edit another member's Message Gate (cross-editable).
+const dynamicGate = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}gate-set`, { name: "buddy", mode: "on", rule: "Be concise." });
+const buddyGate = svc.list().members.find((m) => m.name === "buddy")?.gate;
+assert(dynamicGate.ok && buddyGate?.send?.mode === "on" && buddyGate?.send?.rule === "Be concise.", "gate-set defaults to send and persists the member override");
+assert(dynamicGate.data?.gate?.ruleChars === 11 && !("rule" in dynamicGate.data.gate), "gate-set confirms rule length without echoing arbitrary rule text");
+const invalidAxisGate = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}gate-set`, { name: "buddy", axis: "sideways", rule: "must not overwrite send" });
+assert(!invalidAxisGate.ok && /axis/.test(invalidAxisGate.error || "") && svc.list().members.find((m) => m.name === "buddy")?.gate?.send?.rule === "Be concise.", "gate-set rejects an explicit invalid axis without mutating send");
+const dynamicPartyGate = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}party-gate-set`, { enabled: true, rule: "Keep handoffs direct." });
+assert(dynamicPartyGate.ok && dynamicPartyGate.data?.gate?.ruleChars === 21 && !("rule" in dynamicPartyGate.data.gate), "party-gate-set confirms rule length without echoing the party rule");
+assert(svc.list().parties.find((item) => item.id === partyId)?.gate?.send?.rule === "Keep handoffs direct.", "party-gate-set defaults to send and persists the complete rule");
+
+const excludedBroadcast = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}broadcast`, {
+  content: "only batch-a should receive this batch probe",
+  exclude: ["batch-b"],
+});
+const excludedReach = [...(excludedBroadcast.data?.delivered || []), ...(excludedBroadcast.data?.queuedMembers || []), ...(excludedBroadcast.data?.failed || []).map((item) => item.name)];
+assert(excludedBroadcast.ok && excludedReach.includes("batch-a") && !excludedReach.includes("batch-b"), "broadcast exclude removes selected members from every outcome bucket");
+const unknownExclude = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}broadcast`, { content: "must not send", exclude: ["missing-member"] });
+assert(!unknownExclude.ok && /unknown member/i.test(unknownExclude.error || ""), "broadcast rejects unknown exclusions before sending");
+
+const duplicateRemoval = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}member-remove`, { name: ["batch-a", "batch-a"] });
+assert(!duplicateRemoval.ok && /duplicate/i.test(duplicateRemoval.error || "") && svc.list().members.some((m) => m.name === "batch-a"), "batch removal rejects duplicate names before deleting anything");
+// A name that does not exist is the partial-failure case now that no member is
+// protected: the removals that CAN happen still happen, and the one that cannot
+// is reported instead of quietly dropping the whole batch.
+const batchRemoved = await invokePartyTool(bridge, mainBinding.identity, `${PARTY_TOOL_PREFIX}member-remove`, { name: ["batch-a", "ghost-member", "batch-b"] });
+assert(batchRemoved.ok && batchRemoved.data.removed.sort().join() === "batch-a,batch-b" && batchRemoved.data.failed.some((item) => item.name === "ghost-member"), "member-remove accepts arrays and reports partial failures without hiding successful removals");
+assert(!svc.list().members.some((m) => m.name === "batch-a" || m.name === "batch-b"), "batch removal deletes the members it could delete");
+
+// --- session primer: deterministic surface knowledge (no model memory) -------
+console.log("\nParty primer assertions:");
+const primer = buildPartyPrimer({ party: "team-qa", member: "reviewer", role: "Code reviewer" });
+assert(/AgentParty/.test(primer), "primer introduces the AgentParty app");
+assert(primer.includes("reviewer") && primer.includes("team-qa") && primer.includes("Code reviewer"), "primer states the member's identity (party + name + role)");
+assert(primer.includes("mcp__agentparty-app__send") && primer.includes("mcp__agentparty-app__member-create"), "primer names the agentparty-app tool surface");
+assert(primer.includes("mcp__agentparty-app__broadcast") && primer.includes("mcp__agentparty-app__member-status") && primer.includes("mcp__agentparty-app__interrupt"), "primer teaches the coordination tools (broadcast/status/interrupt)");
+assert(primer.includes("Do not poll member status") && primer.includes("do not repeat unchanged status checks"), "primer forbids wasteful repeated member-status polling");
+assert(primer.includes("mcp__agentparty-app__member-permission"), "primer teaches agents how to change another member's permission");
+assert(/Message Gate/.test(primer) && /reject/i.test(primer) && /force: true/.test(primer), "primer explains the Message Gate (review of outgoing messages, reject→rewrite, force escape hatch)");
+assert(primer.includes("mcp__agentparty-app__gate-set"), "primer names the gate-set tool");
+assert(/interrupt: true/.test(primer), "primer explains the interrupt-and-inject send option");
+assert(/queue: true/.test(primer) && /Never pass `interrupt: false`/.test(primer), "primer keeps generated false values from overriding the saved interrupt preference");
+// A sent message QUEUES behind the recipient's current turn (Codex: next tool
+// call) — the primer must teach this so agents stop expecting instant delivery.
+assert(/QUEUED/.test(primer) && /next tool call/.test(primer), "primer teaches queued delivery + Codex next-tool-call timing");
+assert(/ONE turn at a time/.test(primer) && /tangled/.test(primer), "primer explains the one-turn-at-a-time model that causes perceived turn tangling");
+assert(/LEGACY/.test(primer) && /mcp__agentparty__\*/.test(primer) && /mcp__plugin_\*_agentparty__\*/.test(primer), "primer warns off the legacy agentparty surfaces by name");
+assert(/<channel source="agentparty"/.test(primer), "primer documents the channel communication protocol");
+const noRole = buildPartyPrimer({ party: "p", member: "m" });
+assert(/none specified/.test(noRole), "primer handles a missing role gracefully");
+
+// --- respawn: reload the session, CONTINUING the conversation ----------------
+// The tab toolbar's primary reset. Unlike a hard restart (fresh conversation),
+// respawn tears the old session down and starts a new one that RESUMES the same
+// harness thread — so the conversation continues (model context intact) while
+// new config (e.g. a just-added MCP server) is applied. The app session id
+// changes, but the fresh session is created WITH the old session's harness
+// thread id as its resume target.
+console.log("\nRespawn (reload, keep conversation) assertions:");
+await bridge.createMember({ name: "respawner", role: "r", harness: "claude-code", model: "sonnet" });
+const beforeSession = svc.list().members.find((m) => m.name === "respawner")?.sessionId;
+const beforeThread = sessionManager.harnessSessionId(beforeSession);
+assert(Boolean(beforeSession) && live.has(beforeSession), "respawner starts with a live session");
+resumedWith.length = 0;
+const respawned = svc.respawnMember("respawner", {}, partyId);
+const afterSession = respawned.member?.sessionId;
+assert(respawned.member?.status === "running", "respawned member is running again");
+assert(Boolean(afterSession) && afterSession !== beforeSession, "respawn mints a NEW app session id (the old one is torn down)");
+assert(!live.has(beforeSession), "respawn closed the previous session (old app session no longer live)");
+assert(live.has(afterSession), "the reloaded session is live");
+assert(resumedWith.includes(beforeThread), "respawn RESUMES the old harness thread (conversation continues, not a fresh chat)");
+assert(svc.list().members.find((m) => m.name === "respawner")?.harnessSessionId === beforeThread, "the live harness thread id was captured onto the member before teardown");
+assert(svc.list().members.find((m) => m.name === "respawner")?.model === "sonnet", "respawn preserves the member's persisted config (model)");
+
+// --- member-remove: every member is removable, 'main' included ---------------
+// 'main' is the member a party is BORN with, not a role anything routes through,
+// so removing it is an ordinary removal and a party may end up with none.
+const rmMain = await bridge.removeMember("main");
+assert(rmMain.ok, "member-remove removes 'main' like any other member");
+assert(!svc.list(partyId).members.some((m) => m.name === "main"), "'main' is gone from the party after removal");
+
+console.log(failures.length ? `\nFAILED (${failures.length})` : "\nPARTY BRIDGE PASSED");
+process.exit(failures.length ? 1 : 0);
